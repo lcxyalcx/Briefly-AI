@@ -23,6 +23,7 @@ declare global {
       importPdfs: () => Promise<LibraryState>;
       updatePaper: (input: UpdatePaperInput) => Promise<LibraryState>;
       addNote: (input: NoteInput) => Promise<LibraryState>;
+      removePaper: (paperId: string) => Promise<LibraryState>;
       search: (request: QueryRequest) => Promise<QueryResponse>;
       ask: (request: AskRequest) => Promise<AskResponse>;
       chat: (request: ChatRequest) => Promise<ChatResponse>;

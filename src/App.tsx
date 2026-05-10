@@ -477,6 +477,25 @@ function App() {
     }
   }
 
+  async function handleRemovePaper(paperId: string, title: string) {
+    const confirmed = window.confirm(`确认删除《${title}》吗？这会同时移除本地复制的 PDF。`);
+    if (!confirmed) {
+      return;
+    }
+
+    setBusyAction("paper-remove");
+    try {
+      await syncState(
+        requireApi().removePaper(paperId),
+        "文档已从 Briefly AI 文献库中删除，对应的本地 PDF 副本也已清理。",
+      );
+    } catch (error) {
+      setFeedback(`删除文档失败：${describeError(error)}`, "danger");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleAddNote() {
     if (!selectedPaper || !noteDraft.trim()) {
       setFeedback("先选择一篇论文，再写一条想复用的笔记。", "neutral");
@@ -755,7 +774,7 @@ function App() {
             <span className="eyebrow">Briefly AI</span>
             <span className="eyebrow soft-eyebrow">Local Literature Desk</span>
           </div>
-          <h1>像 Zotero 一样管理文献，像 Insight 工具一样读论文。</h1>
+          <h1>Briefly AI 本地文献工作台，围绕 Insight Card 深度阅读论文。</h1>
           <p>
             左边做筛选与收藏，中间快速定位文献，右边直接进入摘要、检索、问答和聊天。
           </p>
@@ -982,6 +1001,12 @@ function App() {
                       onClick={() => handleRegenerateBrief(selectedPaper.id)}
                     >
                       {busyAction === "brief" ? "生成中…" : "刷新 Insight"}
+                    </button>
+                    <button
+                      className="secondary-button danger-button"
+                      onClick={() => handleRemovePaper(selectedPaper.id, selectedPaper.title)}
+                    >
+                      {busyAction === "paper-remove" ? "删除中…" : "删除文档"}
                     </button>
                   </div>
                 </div>

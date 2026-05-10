@@ -101,6 +101,12 @@ app.whenReady().then(async () => {
     return refreshState();
   });
 
+  ipcMain.handle("library:remove-paper", async (_event, paperId: string) => {
+    const service = await getService();
+    await service.removePaper(paperId);
+    return refreshState();
+  });
+
   ipcMain.handle("library:search", async (_event, request: QueryRequest) => {
     const service = await getService();
     return service.search(request);

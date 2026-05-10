@@ -1158,6 +1158,23 @@ export class LibraryService {
     await this.persist();
   }
 
+  async removePaper(paperId: string) {
+    const paper = this.getPaperById(paperId);
+    if (!paper) {
+      throw new Error("Paper not found.");
+    }
+
+    this.state.papers = this.state.papers.filter((item) => item.id !== paperId);
+
+    try {
+      await fs.rm(paper.storedPdfPath, { force: true });
+    } catch {
+      // If the copied PDF is already missing, we still remove the library entry.
+    }
+
+    await this.persist();
+  }
+
   async updateSettings(patch: SettingsPatch) {
     this.state.settings = sanitizeModelRouting(
       hydrateSettings({

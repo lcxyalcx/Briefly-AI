@@ -24,6 +24,8 @@ const api = {
     ipcRenderer.invoke("library:update-paper", input) as Promise<LibraryState>,
   addNote: (input: NoteInput) =>
     ipcRenderer.invoke("library:add-note", input) as Promise<LibraryState>,
+  removePaper: (paperId: string) =>
+    ipcRenderer.invoke("library:remove-paper", paperId) as Promise<LibraryState>,
   search: (request: QueryRequest) =>
     ipcRenderer.invoke("library:search", request) as Promise<QueryResponse>,
   ask: (request: AskRequest) =>
