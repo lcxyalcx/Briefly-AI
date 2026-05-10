@@ -5,6 +5,7 @@ Briefly AI 是一款面向研究生与科研工作者的本地化文献管理桌
 ## ✨ 核心特性
 
 - 🖥️ 本地桌面端：基于 `Electron + React + TypeScript`
+- 🗃️ Zotero 风格三栏工作台：左侧收藏/筛选，中间文献列表，右侧 Insight Card 与阅读区
 - 📥 PDF 批量导入：通过系统文件选择器导入并复制到应用私有目录
 - 🧩 结构化解析：自动抽取标题、作者、摘要、章节结构、参考文献
 - 🗂️ 文献管理：支持标签、阅读状态、关键词分类
@@ -89,6 +90,12 @@ npm run build
 
 ```bash
 npm run package
+```
+
+如果你只想生成 macOS 安装包：
+
+```bash
+npm run package:dmg
 ```
 
 生成文件位于：

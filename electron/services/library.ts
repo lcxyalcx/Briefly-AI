@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { app } from "electron";
 import type {
+  ApiProviderDraft,
   ApiProviderProfile,
   AskRequest,
   AskResponse,
@@ -29,6 +30,7 @@ import {
   fetchOpenAICompatibleModels,
   generateJsonWithOpenAICompatible,
   importOpenAICompatibleProvider,
+  parseImportedProviderConfig,
   runOpenAICompatibleChat,
 } from "./openai-compatible";
 
@@ -264,6 +266,34 @@ function formatConversation(messages: ChatRequest["messages"]) {
     .join("\n\n");
 }
 
+function buildFallbackCitations(hits: QueryHit[], limit = 2) {
+  return hits.slice(0, limit).map((hit) => buildCitation(hit));
+}
+
+function extractCitationIndexesFromText(text: string, max: number) {
+  const matches = [...text.matchAll(/\[(\d+)\]/g)]
+    .map((match) => Number(match[1]) - 1)
+    .filter((index) => Number.isFinite(index) && index >= 0 && index < max);
+
+  return [...new Set(matches)];
+}
+
+function buildGroundedChatPrompt(
+  request: ChatRequest,
+  hits: QueryHit[],
+) {
+  return [
+    "你是 Briefly AI 的论文阅读助手。",
+    "你的回答必须优先依据给定论文片段，不要编造未出现的信息。",
+    "如果证据不足，请明确说“当前片段不足以支持这个结论”。",
+    "如果引用了片段，请在句末使用 [1] [2] 这样的编号标记。",
+    "对话历史：",
+    formatConversation(request.messages),
+    "论文片段：",
+    formatContextHits(hits, 4),
+  ].join("\n\n");
+}
+
 function hydrateSettings(settings?: Partial<UserSettings>) {
   const merged: UserSettings = {
     ...DEFAULT_SETTINGS,
@@ -488,23 +518,60 @@ async function maybeGenerateApiAnswer(
       "上下文：",
       formatContextHits(hits),
     ].join("\n\n"),
-  });
+  }).catch(() => null);
 
-  if (!payload) {
+  if (payload?.answer) {
+    const indexes = payload.citationIndexes
+      ?.map((value) => value - 1)
+      .filter((value) => value >= 0 && value < hits.length) ?? [0];
+
+    return {
+      question: request.question,
+      answer: payload.answer,
+      citations: indexes.length
+        ? indexes.map((index) => buildCitation(hits[index]))
+        : buildFallbackCitations(hits),
+      latencyMs: 0,
+      mode: "api",
+      confidence: clamp(payload.confidence ?? 0.78, 0.1, 0.99),
+    };
+  }
+
+  const fallback = await runOpenAICompatibleChat({
+    provider,
+    model,
+    messages: [
+      {
+        role: "system",
+        content:
+          "你是严谨的论文问答助手。只依据提供的论文片段回答，不足时明确说当前片段不足。引用请使用 [1] [2] 标记。",
+      },
+      {
+        role: "user",
+        content: [
+          `问题：${request.question}`,
+          "上下文：",
+          formatContextHits(hits),
+        ].join("\n\n"),
+      },
+    ],
+  }).catch(() => null);
+
+  if (!fallback?.text) {
     return null;
   }
 
-  const indexes = payload.citationIndexes
-    ?.map((value) => value - 1)
-    .filter((value) => value >= 0 && value < hits.length) ?? [0];
+  const indexes = extractCitationIndexesFromText(fallback.text, hits.length);
 
   return {
     question: request.question,
-    answer: payload.answer,
-    citations: indexes.map((index) => buildCitation(hits[index])),
+    answer: fallback.text,
+    citations: indexes.length
+      ? indexes.map((index) => buildCitation(hits[index]))
+      : buildFallbackCitations(hits),
     latencyMs: 0,
     mode: "api",
-    confidence: clamp(payload.confidence ?? 0.78, 0.1, 0.99),
+    confidence: clamp(hits[0]?.score * 0.88 + 0.1, 0.18, 0.96),
   };
 }
 
@@ -539,21 +606,48 @@ async function maybeGenerateOllamaAnswer(
     ].join("\n\n"),
   );
 
-  if (!payload) {
+  if (payload?.answer) {
+    const indexes = payload.citationIndexes
+      ?.map((value) => value - 1)
+      .filter((value) => value >= 0 && value < hits.length) ?? [0];
+
+    return {
+      question: request.question,
+      answer: payload.answer,
+      citations: indexes.length
+        ? indexes.map((index) => buildCitation(hits[index]))
+        : buildFallbackCitations(hits),
+      latencyMs: 0,
+      mode: "ollama",
+      confidence: clamp(payload.confidence ?? 0.76, 0.1, 0.99),
+    };
+  }
+
+  const fallback = await generateText(
+    settings,
+    [
+      "你是严谨的论文问答助手。只依据提供的论文片段回答，不足时明确说当前片段不足。引用请使用 [1] [2] 标记。",
+      `问题：${request.question}`,
+      "上下文：",
+      formatContextHits(hits),
+    ].join("\n\n"),
+  );
+
+  if (!fallback) {
     return null;
   }
 
-  const indexes = payload.citationIndexes
-    ?.map((value) => value - 1)
-    .filter((value) => value >= 0 && value < hits.length) ?? [0];
+  const indexes = extractCitationIndexesFromText(fallback, hits.length);
 
   return {
     question: request.question,
-    answer: payload.answer,
-    citations: indexes.map((index) => buildCitation(hits[index])),
+    answer: fallback,
+    citations: indexes.length
+      ? indexes.map((index) => buildCitation(hits[index]))
+      : buildFallbackCitations(hits),
     latencyMs: 0,
     mode: "ollama",
-    confidence: clamp(payload.confidence ?? 0.76, 0.1, 0.99),
+    confidence: clamp(hits[0]?.score * 0.86 + 0.1, 0.18, 0.95),
   };
 }
 
@@ -600,42 +694,61 @@ async function maybeGenerateApiChat(
     return null;
   }
 
-  if (request.useRag && hits.length > 0) {
-    const payload = await generateJsonWithOpenAICompatible<{
-      answer: string;
-      citationIndexes: number[];
-    }>({
+  if (request.useRag) {
+    if (hits.length === 0) {
+      return {
+        reply: {
+          id: uid("chat"),
+          role: "assistant",
+          content:
+            "这次没有检索到足够相关的论文片段，所以我不想假装自己已经读到了证据。你可以换一个更具体的问题、切到“全库检索”，或者先关闭 RAG 做自由讨论。",
+          createdAt: new Date().toISOString(),
+          citations: [],
+          model,
+        },
+        latencyMs: 0,
+        mode: "api",
+        groundedBy: [],
+      };
+    }
+
+    const result = await runOpenAICompatibleChat({
       provider,
       model,
-      prompt: [
-        "你是 Briefly AI 的论文聊天机器人。",
-        "根据下面的对话历史与论文片段继续回答。",
-        "如果上下文不足，请明确说明还需要更多文献内容。",
-        "输出 JSON，字段：answer, citationIndexes。",
-        "对话历史：",
-        formatConversation(request.messages),
-        "论文片段：",
-        formatContextHits(hits, 4),
-      ].join("\n\n"),
-    });
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是 Briefly AI 的论文聊天机器人。回答必须依据提供的论文片段，不要编造。引用请用 [1] [2] 标记；如果证据不足，明确说明当前片段不足。",
+        },
+        {
+          role: "system",
+          content: `可用论文片段：\n\n${formatContextHits(hits, 4)}`,
+        },
+        ...request.messages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+      ],
+    }).catch(() => null);
 
-    if (!payload) {
+    if (!result?.text) {
       return null;
     }
 
-    const indexes = payload.citationIndexes
-      ?.map((value) => value - 1)
-      .filter((value) => value >= 0 && value < hits.length) ?? [];
-    const groundedBy = indexes.map((index) => buildCitation(hits[index]));
+    const indexes = extractCitationIndexesFromText(result.text, hits.length);
+    const groundedBy = indexes.length
+      ? indexes.map((index) => buildCitation(hits[index]))
+      : buildFallbackCitations(hits);
 
     return {
       reply: {
         id: uid("chat"),
         role: "assistant",
-        content: payload.answer,
+        content: result.text,
         createdAt: new Date().toISOString(),
         citations: groundedBy,
-        model,
+        model: result.model,
       },
       latencyMs: 0,
       mode: "api",
@@ -688,38 +801,39 @@ async function maybeGenerateOllamaChat(
     return null;
   }
 
-  if (request.useRag && hits.length > 0) {
-    const payload = await generateJson<{
-      answer: string;
-      citationIndexes: number[];
-    }>(
-      settings,
-      [
-        "你是 Briefly AI 的论文聊天机器人。",
-        "根据下面的对话历史与论文片段继续回答。",
-        "如果上下文不足，请明确说明还需要更多文献内容。",
-        "输出 JSON，字段：answer, citationIndexes。",
-        "对话历史：",
-        formatConversation(request.messages),
-        "论文片段：",
-        formatContextHits(hits, 4),
-      ].join("\n\n"),
-    );
+  if (request.useRag) {
+    if (hits.length === 0) {
+      return {
+        reply: {
+          id: uid("chat"),
+          role: "assistant",
+          content:
+            "当前没有检索到足够相关的片段，我先不把自由生成内容伪装成论文结论。你可以改写问题、扩大到全库检索，或者关闭 RAG 继续聊。",
+          createdAt: new Date().toISOString(),
+          citations: [],
+          model: settings.ollamaModel,
+        },
+        latencyMs: 0,
+        mode: "ollama",
+        groundedBy: [],
+      };
+    }
 
-    if (!payload) {
+    const text = await generateText(settings, buildGroundedChatPrompt(request, hits));
+    if (!text) {
       return null;
     }
 
-    const indexes = payload.citationIndexes
-      ?.map((value) => value - 1)
-      .filter((value) => value >= 0 && value < hits.length) ?? [];
-    const groundedBy = indexes.map((index) => buildCitation(hits[index]));
+    const indexes = extractCitationIndexesFromText(text, hits.length);
+    const groundedBy = indexes.length
+      ? indexes.map((index) => buildCitation(hits[index]))
+      : buildFallbackCitations(hits);
 
     return {
       reply: {
         id: uid("chat"),
         role: "assistant",
-        content: payload.answer,
+        content: text,
         createdAt: new Date().toISOString(),
         citations: groundedBy,
         model: settings.ollamaModel,
@@ -786,6 +900,23 @@ function buildHeuristicChat(
       latencyMs: 0,
       mode: "heuristic",
       groundedBy: answer.citations,
+    };
+  }
+
+  if (request.useRag) {
+    return {
+      reply: {
+        id: uid("chat"),
+        role: "assistant",
+        content:
+          "我没有从当前检索范围里找到足够相关的论文片段，所以暂时不给出带依据的 RAG 回答。你可以换个更具体的问题、切到全库检索，或者先关闭 RAG 做自由讨论。",
+        createdAt: new Date().toISOString(),
+        citations: [],
+        model: "heuristic-rag",
+      },
+      latencyMs: 0,
+      mode: "heuristic",
+      groundedBy: [],
     };
   }
 
@@ -1039,6 +1170,10 @@ export class LibraryService {
       }),
     );
     await this.persist();
+  }
+
+  parseApiProviderDraft(rawText: string): ApiProviderDraft {
+    return parseImportedProviderConfig(rawText);
   }
 
   async importApiProvider(input: ImportApiProviderInput) {

@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  ApiProviderDraft,
   AskRequest,
   AskResponse,
   ChatRequest,
@@ -33,6 +34,8 @@ const api = {
     ipcRenderer.invoke("library:regenerate-brief", paperId) as Promise<LibraryState>,
   updateSettings: (patch: SettingsPatch) =>
     ipcRenderer.invoke("library:update-settings", patch) as Promise<LibraryState>,
+  parseApiProviderDraft: (rawText: string) =>
+    ipcRenderer.invoke("library:parse-api-provider-draft", rawText) as Promise<ApiProviderDraft>,
   importApiProvider: (input: ImportApiProviderInput) =>
     ipcRenderer.invoke("library:import-api-provider", input) as Promise<LibraryState>,
   refreshApiProviderModels: (providerId: string) =>

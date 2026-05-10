@@ -39,7 +39,16 @@ function stripCodeFence(raw: string) {
 }
 
 function normalizeBaseUrl(baseUrl: string) {
-  return baseUrl.trim().replace(/\/+$/, "");
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    return "";
+  }
+
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return `https://${trimmed}`;
+  }
+
+  return trimmed;
 }
 
 function candidateBaseUrls(baseUrl: string) {
@@ -103,13 +112,30 @@ function parseJsonDraft(raw: string): ParsedImportDraft | null {
         parsed.name ?? parsed.provider ?? parsed.providerName ?? "",
       ).trim() || undefined,
       baseUrl: String(
-        parsed.baseUrl ?? parsed.base_url ?? parsed.endpoint ?? parsed.url ?? "",
+        parsed.baseUrl ??
+          parsed.base_url ??
+          parsed.apiBase ??
+          parsed.api_base ??
+          parsed.apiUrl ??
+          parsed.api_url ??
+          parsed.endpoint ??
+          parsed.url ??
+          parsed.host ??
+          "",
       ).trim() || undefined,
       apiKey: String(
-        parsed.apiKey ?? parsed.api_key ?? parsed.key ?? parsed.token ?? "",
+        parsed.apiKey ??
+          parsed.api_key ??
+          parsed.openaiApiKey ??
+          parsed.openai_api_key ??
+          parsed.key ??
+          parsed.token ??
+          "",
       ).trim() || undefined,
       defaultModel: String(
         parsed.defaultModel ??
+          parsed.chatModel ??
+          parsed.chat_model ??
           parsed.mainModel ??
           parsed.main_model ??
           parsed.model ??
@@ -137,9 +163,26 @@ function parseUrlDraft(raw: string): ParsedImportDraft | null {
 
     return {
       name: read("name", "provider", "providerName"),
-      baseUrl: read("baseUrl", "base_url", "endpoint", "url"),
-      apiKey: read("apiKey", "api_key", "key", "token"),
-      defaultModel: read("defaultModel", "mainModel", "main_model", "model"),
+      baseUrl: read(
+        "baseUrl",
+        "base_url",
+        "apiBase",
+        "api_base",
+        "apiUrl",
+        "api_url",
+        "endpoint",
+        "url",
+        "host",
+      ),
+      apiKey: read("apiKey", "api_key", "openaiApiKey", "openai_api_key", "key", "token"),
+      defaultModel: read(
+        "defaultModel",
+        "chatModel",
+        "chat_model",
+        "mainModel",
+        "main_model",
+        "model",
+      ),
       models: models.length > 0 ? models : undefined,
     };
   } catch {
@@ -176,9 +219,33 @@ function parseEnvDraft(raw: string): ParsedImportDraft | null {
 
   return {
     name: read("name", "provider", "provider_name"),
-    baseUrl: read("base_url", "baseurl", "endpoint", "url"),
-    apiKey: read("api_key", "apikey", "key", "token"),
-    defaultModel: read("default_model", "main_model", "mainmodel", "model"),
+    baseUrl: read(
+      "base_url",
+      "baseurl",
+      "api_base",
+      "apiurl",
+      "api_url",
+      "openai_api_base",
+      "openai_base_url",
+      "endpoint",
+      "url",
+      "host",
+    ),
+    apiKey: read(
+      "api_key",
+      "apikey",
+      "openai_api_key",
+      "openai_key",
+      "key",
+      "token",
+    ),
+    defaultModel: read(
+      "default_model",
+      "chat_model",
+      "main_model",
+      "mainmodel",
+      "model",
+    ),
     models: models && models.length > 0 ? models : undefined,
   };
 }
@@ -206,8 +273,13 @@ async function requestOpenAICompatible(
   let lastError: string | null = null;
 
   for (const candidate of candidateBaseUrls(baseUrl)) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
     try {
-      const response = await fetch(`${candidate}${path}`, init);
+      const response = await fetch(`${candidate}${path}`, {
+        ...init,
+        signal: controller.signal,
+      });
       if (response.ok) {
         return {
           response,
@@ -226,6 +298,8 @@ async function requestOpenAICompatible(
       throw new Error(message);
     } catch (error) {
       lastError = error instanceof Error ? error.message : "Unknown request error";
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -306,6 +380,10 @@ export async function importOpenAICompatibleProvider(input: {
     ].filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
 
     models = fallbackModels.map((id) => ({ id }));
+  }
+
+  if (models.length === 0 && !preferredModel) {
+    throw new Error("无法自动获取模型列表，请补充一个默认模型后再保存。");
   }
 
   return {

@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import path from "node:path";
 import { LibraryService } from "./services/library";
 import type {
+  ApiProviderDraft,
   AskRequest,
   ChatRequest,
   ImportApiProviderInput,
@@ -130,6 +131,14 @@ app.whenReady().then(async () => {
       const service = await getService();
       await service.updateSettings(patch);
       return refreshState();
+    },
+  );
+
+  ipcMain.handle(
+    "library:parse-api-provider-draft",
+    async (_event, rawText: string): Promise<ApiProviderDraft> => {
+      const service = await getService();
+      return service.parseApiProviderDraft(rawText);
     },
   );
 

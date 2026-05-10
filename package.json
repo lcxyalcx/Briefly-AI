@@ -13,6 +13,7 @@
     "build:renderer": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "package": "npm run build && electron-builder",
+    "package:dmg": "npm run build && electron-builder --mac dmg",
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "build": {

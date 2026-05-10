@@ -119,6 +119,14 @@ export interface ApiProviderProfile {
   lastSyncedAt?: string;
 }
 
+export interface ApiProviderDraft {
+  name?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  defaultModel?: string;
+  models?: string[];
+}
+
 export interface ModelRouting {
   summaryModel?: string;
   ragModel?: string;

@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 
 import type {
+  ApiProviderDraft,
   AskRequest,
   AskResponse,
   ChatRequest,
@@ -27,6 +28,7 @@ declare global {
       chat: (request: ChatRequest) => Promise<ChatResponse>;
       regenerateBrief: (paperId: string) => Promise<LibraryState>;
       updateSettings: (patch: SettingsPatch) => Promise<LibraryState>;
+      parseApiProviderDraft: (rawText: string) => Promise<ApiProviderDraft>;
       importApiProvider: (input: ImportApiProviderInput) => Promise<LibraryState>;
       refreshApiProviderModels: (providerId: string) => Promise<LibraryState>;
       removeApiProvider: (providerId: string) => Promise<LibraryState>;
