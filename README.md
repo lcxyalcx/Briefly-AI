@@ -16,6 +16,10 @@ Briefly AI 是一款面向研究生与科研工作者的本地化文献管理桌
 - 🔐 本地优先：默认启用 heuristic 模式，也支持本地 `Ollama` 与外部 API 模型
 - 📦 桌面打包：已支持生成 macOS `zip` 与 `dmg`
 
+## 🖼️ 实际界面
+
+![Briefly AI 界面截图](./image.png)
+
 ## 🏗️ 产品形态
 
 Briefly AI 是本地软件。
