@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import path from "node:path";
+import dotenv from "dotenv";
 import { LibraryService } from "./services/library";
 import type {
   ApiProviderDraft,
@@ -13,6 +14,8 @@ import type {
   SettingsPatch,
   UpdatePaperInput,
 } from "../src/shared/contracts";
+
+dotenv.config({ path: path.join(__dirname, "../../.env") });
 
 let mainWindow: BrowserWindow | null = null;
 let libraryService: LibraryService | null = null;
@@ -182,7 +185,23 @@ app.whenReady().then(async () => {
       throw new Error("Paper not found.");
     }
 
-    await shell.openPath(paper.storedPdfPath);
+    const errorMessage = await shell.openPath(paper.storedPdfPath);
+    if (errorMessage) {
+      throw new Error(errorMessage);
+    }
+
+    await service.touchPaperOpened(paperId);
+    return refreshState();
+  });
+
+  ipcMain.handle("library:reveal-pdf", async (_event, paperId: string) => {
+    const service = await getService();
+    const paper = service.getPaperById(paperId);
+    if (!paper) {
+      throw new Error("Paper not found.");
+    }
+
+    shell.showItemInFolder(paper.storedPdfPath);
     return true;
   });
 

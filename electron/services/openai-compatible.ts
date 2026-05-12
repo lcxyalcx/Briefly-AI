@@ -76,6 +76,84 @@ function textFromContent(
   return "";
 }
 
+/** 从 HTTP 响应体里抽出可读说明（兼容 SiliconFlow 等返回 { code, message } 的形态） */
+function rawProviderErrorLine(rawBody: string): string {
+  const trimmed = rawBody.trim().slice(0, 4000);
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    if (typeof parsed.message === "string" && parsed.message.trim()) {
+      return parsed.message.trim();
+    }
+    const nested = parsed.error;
+    if (nested && typeof nested === "object") {
+      const msg = (nested as Record<string, unknown>).message;
+      if (typeof msg === "string" && msg.trim()) {
+        return msg.trim();
+      }
+    }
+  } catch {
+    // 非 JSON，沿用正文节选
+  }
+
+  return trimmed.slice(0, 960);
+}
+
+function providerPayloadIndicatesMissingModel(rawBody: string): boolean {
+  const trimmed = rawBody.trim().slice(0, 4000);
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    const code = parsed.code;
+    if (code === 20012 || code === "20012") {
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+function looksLikeModelMissingProviderMessage(line: string): boolean {
+  if (providerPayloadIndicatesMissingModel(line)) {
+    return true;
+  }
+  const m = line.toLowerCase();
+  return (
+    m.includes("model does not exist") ||
+    m.includes("model_not_found") ||
+    m.includes("invalid model") ||
+    m.includes("unknown model") ||
+    m.includes("model specified incorrectly") ||
+    m.includes("no such model") ||
+    m.includes("incorrect model id")
+  );
+}
+
+function formatProviderHttpErrorBody(rawBody: string): string {
+  const inner = rawProviderErrorLine(rawBody);
+  const core = inner || rawBody.trim().slice(0, 960);
+
+  if (
+    providerPayloadIndicatesMissingModel(rawBody) ||
+    looksLikeModelMissingProviderMessage(core)
+  ) {
+    const detail = core.slice(0, 280);
+    return `模型不可用或未在当前服务商生效${detail ? `（${detail}）` : ""}。请到设置 → API Provider 点击「刷新模型列表」，并将「对话 / RAG / 摘要」所用模型改为下拉列表中的可用型号。`;
+  }
+
+  return core.slice(0, 960);
+}
+
+function chatErrorSuggestsWrongModel(message: string): boolean {
+  return (
+    /模型不可用|未在当前服务商生效/.test(message) ||
+    looksLikeModelMissingProviderMessage(message)
+  );
+}
+
 function extractJsonBlock(value: string): string {
   const fenced = value.match(/```json\s*([\s\S]*?)```/i);
   if (fenced?.[1]) {
@@ -269,12 +347,13 @@ async function requestOpenAICompatible(
   baseUrl: string,
   path: string,
   init?: RequestInit,
+  timeoutMs = 15000,
 ) {
   let lastError: string | null = null;
 
   for (const candidate of candidateBaseUrls(baseUrl)) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(`${candidate}${path}`, {
         ...init,
@@ -288,14 +367,14 @@ async function requestOpenAICompatible(
       }
 
       const body = await response.text();
-      const message = body.slice(0, 280) || response.statusText;
+      const detail = formatProviderHttpErrorBody(body);
 
       if (response.status === 404) {
-        lastError = message;
+        lastError = detail;
         continue;
       }
 
-      throw new Error(message);
+      throw new Error(detail);
     } catch (error) {
       lastError = error instanceof Error ? error.message : "Unknown request error";
     } finally {
@@ -318,6 +397,7 @@ export async function fetchOpenAICompatibleModels(
         Authorization: `Bearer ${apiKey}`,
       },
     },
+    20000,
   );
 
   const payload = (await response.json()) as ModelsResponse;
@@ -401,40 +481,75 @@ export async function importOpenAICompatibleProvider(input: {
   };
 }
 
+/** 文献 RAG / 长回答容易超过默认 15s，单独放宽 chat/completions 超时 */
+const CHAT_COMPLETION_TIMEOUT_MS = 120000;
+
 export async function runOpenAICompatibleChat(options: {
   provider: ApiProviderProfile;
   model: string;
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
   temperature?: number;
+  maxTokens?: number;
 }) {
-  const { response } = await requestOpenAICompatible(
-    options.provider.baseUrl,
-    "/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${options.provider.apiKey}`,
-        "Content-Type": "application/json",
+  const payloadBody = (model: string) =>
+    JSON.stringify({
+      model,
+      messages: options.messages,
+      temperature: options.temperature ?? 0.2,
+      max_tokens: options.maxTokens ?? 4096,
+    });
+
+  const completionWithModel = async (model: string) => {
+    const { response } = await requestOpenAICompatible(
+      options.provider.baseUrl,
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${options.provider.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: payloadBody(model),
       },
-      body: JSON.stringify({
-        model: options.model,
-        messages: options.messages,
-        temperature: options.temperature ?? 0.2,
-      }),
-    },
-  );
+      CHAT_COMPLETION_TIMEOUT_MS,
+    );
 
-  const payload = (await response.json()) as ChatCompletionsResponse;
-  const content = textFromContent(payload.choices?.[0]?.message?.content);
+    const payload = (await response.json()) as ChatCompletionsResponse;
+    const content = textFromContent(payload.choices?.[0]?.message?.content);
 
-  if (!content) {
-    throw new Error("Provider returned an empty assistant message.");
-  }
+    if (!content) {
+      throw new Error("Provider returned an empty assistant message.");
+    }
 
-  return {
-    text: content,
-    model: payload.model ?? options.model,
+    return {
+      text: content,
+      model: payload.model ?? model,
+    };
   };
+
+  try {
+    return await completionWithModel(options.model);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : "";
+    if (chatErrorSuggestsWrongModel(msg)) {
+      const fallbackCandidates = [
+        options.provider.defaultModel?.trim(),
+        ...options.provider.models.map((item) => item.id.trim()),
+      ].filter(
+        (model, index, list): model is string =>
+          Boolean(model) && model !== options.model && list.indexOf(model) === index,
+      );
+
+      for (const candidate of fallbackCandidates) {
+        try {
+          return await completionWithModel(candidate);
+        } catch {
+          // 继续尝试下一个候选模型
+        }
+      }
+    }
+    throw error;
+  }
 }
 
 export async function generateJsonWithOpenAICompatible<T>(options: {

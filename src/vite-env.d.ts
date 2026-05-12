@@ -33,7 +33,8 @@ declare global {
       importApiProvider: (input: ImportApiProviderInput) => Promise<LibraryState>;
       refreshApiProviderModels: (providerId: string) => Promise<LibraryState>;
       removeApiProvider: (providerId: string) => Promise<LibraryState>;
-      openPdf: (paperId: string) => Promise<boolean>;
+      openPdf: (paperId: string) => Promise<LibraryState>;
+      revealPdfInFolder: (paperId: string) => Promise<boolean>;
     };
   }
 }

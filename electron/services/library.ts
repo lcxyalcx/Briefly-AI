@@ -16,6 +16,7 @@ import type {
   PaperChunk,
   PaperFilter,
   ParsedPaper,
+  ProviderModelOption,
   QueryHit,
   QueryRequest,
   QueryResponse,
@@ -25,6 +26,7 @@ import type {
   ImportApiProviderInput,
 } from "../../src/shared/contracts";
 import { parsePdfDocument, embedText } from "./pdf";
+import { excerptForRetrieval } from "./textCleanup";
 import { generateJson, generateText, isOllamaAvailable } from "./ollama";
 import {
   fetchOpenAICompatibleModels,
@@ -56,6 +58,25 @@ const DEFAULT_SETTINGS: UserSettings = {
   activeApiProviderId: undefined,
   modelRouting: {},
 };
+
+/** 环境变量优先接入硅基流动时使用（与设置里的 SiliconFlow 条目对齐） */
+const SILICONFLOW_PREFERRED_BASE = "https://api.siliconflow.cn/v1";
+
+/** 指导模型做“读论文”而非复述乱码段落 */
+const DOCUMENT_READER_SYSTEM_ZH = [
+  "你是帮助科研人员读懂论文的助手，而不是把 PDF 文本层逐字打印出来。",
+  "上下文来自 PDF 自动抽取：表格、公式、图注与双栏排版常被拆散，可能出现看似乱码的数字或列错位。",
+  "请用清楚的中文解释含义、方法与结论；不要逐字复述明显无结构的乱码或可疑的表格数字串。",
+  "若用户的问题依赖表格或精确数值而片段无法判断，请明说“当前摘录不足以还原该表/该数值”，并建议用户到对应页码打开原 PDF 核对；在此基础上可概括你能从文本中合理推断的信息。",
+].join("");
+
+const RAG_QA_SYSTEM_ZH = `${DOCUMENT_READER_SYSTEM_ZH} 只允许依据提供的编号片段作答；信息不足时明确说明。回答中请用 [1] [2] 等引用片段编号。`;
+
+const FREE_CHAT_SYSTEM_ZH = [
+  DOCUMENT_READER_SYSTEM_ZH,
+  "若系统消息里已附带「当前选中文献」的标题与摘要，用户所说「这篇文章」「此文」「该论文」默认指该文献，可据此做概述；表格细节与精确数值仍建议开启 RAG 或核对 PDF。",
+  "若没有任何文献上下文且用户也未粘贴段落，请如实说明依据有限。",
+].join("");
 
 function uid(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
@@ -147,14 +168,61 @@ function topSentencesByQuery(text: string, query: string, maxSentences = 2) {
     .join(" ");
 }
 
-function formatContextHits(hits: QueryHit[], limit = 5) {
-  return hits
-    .slice(0, limit)
-    .map(
-      (hit, index) =>
-        `[${index + 1}] ${hit.paperTitle} | p.${hit.page} | ${hit.sectionTitle ?? "Section"}\n${hit.excerpt}`,
+/** 多轮追问常与上一轮话题绑定；拼接近期用户提问做检索查询，接近 GPT 对「会话内文档」的持续指向 */
+function buildChatRetrievalQuery(
+  messages: ChatRequest["messages"],
+  maxUserTurns = 3,
+  maxChars = 1200,
+): string {
+  const userTexts = messages
+    .filter((message) => message.role === "user")
+    .map((message) => message.content.trim())
+    .filter(Boolean);
+
+  const selected =
+    userTexts.length <= maxUserTurns
+      ? userTexts
+      : userTexts.slice(userTexts.length - maxUserTurns);
+
+  const combined = selected.join("\n\n").trim();
+  if (!combined) {
+    return "";
+  }
+
+  return combined.length > maxChars ? combined.slice(combined.length - maxChars) : combined;
+}
+
+function formatContextHits(hits: QueryHit[], limit = 5, maxTotalChars = 16000) {
+  const header =
+    "【片段性质】下列为检索到的正文层摘录，不是表格的结构化还原；列/行可能曾在提取时错位，请结合页码理解大意。\n\n";
+
+  const slice = hits.slice(0, limit);
+  if (slice.length === 0) {
+    return "";
+  }
+
+  const blocks = slice.map(
+    (hit, index) =>
+      `[${index + 1}] ${hit.paperTitle} | p.${hit.page} | ${hit.sectionTitle ?? "正文段落"}\n${hit.excerpt}`,
+  );
+
+  let body = blocks.join("\n\n");
+  const full = `${header}${body}`;
+  if (full.length <= maxTotalChars) {
+    return full;
+  }
+
+  const separators = Math.max(0, slice.length - 1) * 2;
+  const bodyBudget = Math.max(400, maxTotalChars - header.length - separators);
+  const perBlock = Math.floor(bodyBudget / slice.length);
+
+  body = blocks
+    .map((block) =>
+      block.length <= perBlock ? block : `${block.slice(0, Math.max(120, perBlock - 1))}…`,
     )
     .join("\n\n");
+
+  return `${header}${body}`;
 }
 
 function getSectionDigest(paper: ParsedPaper, keywords: string[]) {
@@ -203,7 +271,7 @@ function rankQueryHits(
           paperTitle: paper.title,
           page: chunk.page,
           sectionTitle: chunk.sectionTitle,
-          excerpt: chunk.text.slice(0, 480),
+          excerpt: excerptForRetrieval(chunk.text, 520),
           score: Number(hybrid.toFixed(4)),
           keywordScore: Number(lexical.toFixed(4)),
         } satisfies QueryHit;
@@ -266,6 +334,38 @@ function formatConversation(messages: ChatRequest["messages"]) {
     .join("\n\n");
 }
 
+/** 自由对话未开 RAG 时注入「当前选中论文」，让用户能说「这篇文章」 */
+function formatPaperFocusBlock(paper: ParsedPaper, maxTotalChars = 8000): string {
+  const authors =
+    paper.authors?.filter(Boolean).join("；").trim() || "（作者信息未识别）";
+  const briefBits = [
+    paper.brief?.tldr?.trim() && `TL;DR（应用内摘要）：${paper.brief.tldr.trim()}`,
+    paper.brief?.methods?.trim() &&
+      `方法要点：${paper.brief.methods.trim().slice(0, 720)}`,
+  ].filter(Boolean);
+
+  const abstractPart =
+    paper.abstract?.trim() ||
+    extractSentences(paper.text, 6, 2000) ||
+    "（暂无摘要文本）";
+
+  const header = [
+    `标题：${paper.title}`,
+    `作者：${authors}`,
+    paper.year ? `年份：${paper.year}` : "",
+    `研究领域：${paper.researchArea?.trim() || "未分类"}`,
+    `页数：${paper.pageCount}`,
+    "",
+  ].filter(Boolean);
+
+  const body = [...briefBits, "", "摘要（PDF 文本层）：", abstractPart].join("\n");
+  const full = `${header.join("\n")}\n${body}`;
+  if (full.length <= maxTotalChars) {
+    return full;
+  }
+  return `${full.slice(0, maxTotalChars - 30)}\n…（文献上下文过长已截断）`;
+}
+
 function buildFallbackCitations(hits: QueryHit[], limit = 2) {
   return hits.slice(0, limit).map((hit) => buildCitation(hit));
 }
@@ -283,9 +383,8 @@ function buildGroundedChatPrompt(
   hits: QueryHit[],
 ) {
   return [
-    "你是 Briefly AI 的论文阅读助手。",
+    RAG_QA_SYSTEM_ZH,
     "你的回答必须优先依据给定论文片段，不要编造未出现的信息。",
-    "如果证据不足，请明确说“当前片段不足以支持这个结论”。",
     "如果引用了片段，请在句末使用 [1] [2] 这样的编号标记。",
     "对话历史：",
     formatConversation(request.messages),
@@ -415,6 +514,7 @@ async function maybeGenerateApiBrief(
       "请基于下面的论文内容，输出一个 JSON 对象，字段为：",
       'tldr, methods, innovations, experiments, limitations, reusableNotes。',
       "要求：输出中文；每个字段内容要具体、克制、可复用；reusableNotes 返回字符串数组。",
+      "正文来自 PDF 自动提取，表格与双栏可能出现乱序；请做可读归纳，不要逐字复述明显乱码片段。",
       "论文内容：",
       context,
     ].join("\n"),
@@ -460,10 +560,11 @@ async function maybeGenerateOllamaBrief(
     reusableNotes: string[];
   }>(
     settings,
-    [
+      [
       "请基于下面的论文内容，输出一个 JSON 对象，字段为：",
       'tldr, methods, innovations, experiments, limitations, reusableNotes。',
       "要求：输出中文；每个字段内容要具体、克制、可复用；reusableNotes 返回字符串数组。",
+      "正文来自 PDF 自动提取，表格与双栏可能出现乱序；请做可读归纳，不要逐字复述明显乱码片段。",
       "论文内容：",
       context,
     ].join("\n"),
@@ -510,8 +611,7 @@ async function maybeGenerateApiAnswer(
     provider,
     model,
     prompt: [
-      "根据给定论文片段回答问题。",
-      "只允许依据上下文作答，信息不足时明确说不知道。",
+      RAG_QA_SYSTEM_ZH,
       "输出 JSON，字段：answer, citationIndexes, confidence。",
       "问题：",
       request.question,
@@ -543,8 +643,7 @@ async function maybeGenerateApiAnswer(
     messages: [
       {
         role: "system",
-        content:
-          "你是严谨的论文问答助手。只依据提供的论文片段回答，不足时明确说当前片段不足。引用请使用 [1] [2] 标记。",
+        content: RAG_QA_SYSTEM_ZH,
       },
       {
         role: "user",
@@ -596,8 +695,7 @@ async function maybeGenerateOllamaAnswer(
   }>(
     settings,
     [
-      "根据给定论文片段回答问题。",
-      "只允许依据上下文作答，信息不足时明确说不知道。",
+      RAG_QA_SYSTEM_ZH,
       "输出 JSON，字段：answer, citationIndexes, confidence。",
       "问题：",
       request.question,
@@ -626,7 +724,7 @@ async function maybeGenerateOllamaAnswer(
   const fallback = await generateText(
     settings,
     [
-      "你是严谨的论文问答助手。只依据提供的论文片段回答，不足时明确说当前片段不足。引用请使用 [1] [2] 标记。",
+      RAG_QA_SYSTEM_ZH,
       `问题：${request.question}`,
       "上下文：",
       formatContextHits(hits),
@@ -661,7 +759,13 @@ function buildExtractiveAnswer(request: AskRequest, hits: QueryHit[]): AskRespon
     .join("\n\n");
 
   const answer = selected.length
-    ? `根据已检索到的论文片段，和问题最相关的信息如下：\n\n${answerBody}\n\n如果你要继续精读，优先回看这些引用段落的上下文。`
+    ? [
+        "下面是与问题最相关的正文摘录（来源为 PDF 文本层；表格等区域可能在提取时错位，请以 PDF 原页为准）：",
+        "",
+        answerBody,
+        "",
+        "以上为检索结果的直接摘录，侧重帮你定位段落；若要表格细节或精确数值，请到引用页打开原文核对。",
+      ].join("\n")
     : "当前没有检索到足够相关的片段，建议换一个更具体的问题，或者先限定到单篇论文后再问。";
 
   const confidence = selected.length
@@ -682,6 +786,7 @@ async function maybeGenerateApiChat(
   request: ChatRequest,
   hits: QueryHit[],
   settings: UserSettings,
+  focusPaper?: ParsedPaper,
 ): Promise<ChatResponse | null> {
   if (settings.provider !== "api") {
     return null;
@@ -718,12 +823,11 @@ async function maybeGenerateApiChat(
       messages: [
         {
           role: "system",
-          content:
-            "你是 Briefly AI 的论文聊天机器人。回答必须依据提供的论文片段，不要编造。引用请用 [1] [2] 标记；如果证据不足，明确说明当前片段不足。",
+          content: RAG_QA_SYSTEM_ZH,
         },
         {
           role: "system",
-          content: `可用论文片段：\n\n${formatContextHits(hits, 4)}`,
+          content: `可用论文片段（所选文献通过检索得到的摘录，可视作本会话的附加阅读材料；若不足以回答请直接说明）：\n\n${formatContextHits(hits, 4)}`,
         },
         ...request.messages.map((message) => ({
           role: message.role,
@@ -762,9 +866,16 @@ async function maybeGenerateApiChat(
     messages: [
       {
         role: "system",
-        content:
-          "你是 Briefly AI 的学术阅读助手，回答要清晰、具体、不过度编造；如果用户没有给论文上下文，也要诚实说明你的假设。",
+        content: FREE_CHAT_SYSTEM_ZH,
       },
+      ...(focusPaper
+        ? [
+            {
+              role: "system" as const,
+              content: `【当前选中文献】用户在应用中选中了下列文献；未开启片段检索（RAG）时仍可依据标题、摘要与应用内 TL;DR 回答「这篇文章」类问题。\n\n${formatPaperFocusBlock(focusPaper)}`,
+            },
+          ]
+        : []),
       ...request.messages.map((message) => ({
         role: message.role,
         content: message.content,
@@ -791,6 +902,7 @@ async function maybeGenerateOllamaChat(
   request: ChatRequest,
   hits: QueryHit[],
   settings: UserSettings,
+  focusPaper?: ParsedPaper,
 ): Promise<ChatResponse | null> {
   if (settings.provider !== "ollama") {
     return null;
@@ -847,10 +959,13 @@ async function maybeGenerateOllamaChat(
   const text = await generateText(
     settings,
     [
-      "你是 Briefly AI 的学术阅读助手，回答要清晰、具体、不过度编造；如果用户没有给论文上下文，也要诚实说明你的假设。",
+      FREE_CHAT_SYSTEM_ZH,
+      focusPaper ? `【当前选中文献】\n${formatPaperFocusBlock(focusPaper)}` : "",
       "对话历史：",
       formatConversation(request.messages),
-    ].join("\n\n"),
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
   );
 
   if (!text) {
@@ -875,6 +990,7 @@ async function maybeGenerateOllamaChat(
 function buildHeuristicChat(
   request: ChatRequest,
   hits: QueryHit[],
+  focusPaper?: ParsedPaper,
 ): ChatResponse {
   if (request.useRag && hits.length > 0) {
     const latestUserMessage =
@@ -913,6 +1029,41 @@ function buildHeuristicChat(
         createdAt: new Date().toISOString(),
         citations: [],
         model: "heuristic-rag",
+      },
+      latencyMs: 0,
+      mode: "heuristic",
+      groundedBy: [],
+    };
+  }
+
+  if (focusPaper) {
+    const tldr = focusPaper.brief?.tldr?.trim();
+    const abstractSnip = extractSentences(
+      focusPaper.abstract || focusPaper.text,
+      8,
+      2800,
+    );
+    const content = [
+      `当前为本地轻量模式：下面是根据文库记录整理的「${focusPaper.title}」，便于回答「介绍一下这篇文章」等问题（非云端模型生成）：`,
+      "",
+      tldr ? `【TL;DR】${tldr}` : "",
+      "",
+      "【摘要摘录】",
+      abstractSnip,
+      "",
+      "若要模型用自然语言概括全文或带检索片段依据，请在设置中启用 API / Ollama，或在对话中开启 RAG。",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return {
+      reply: {
+        id: uid("chat"),
+        role: "assistant",
+        content,
+        createdAt: new Date().toISOString(),
+        citations: [],
+        model: "heuristic-paper-context",
       },
       latencyMs: 0,
       mode: "heuristic",
@@ -1060,7 +1211,72 @@ export class LibraryService {
       await fs.writeFile(libraryPath, JSON.stringify(state, null, 2), "utf8");
     }
 
-    return new LibraryService(rootDir, libraryPath, documentDir, state);
+    const service = new LibraryService(rootDir, libraryPath, documentDir, state);
+    await service.mergePreferredSiliconFlowFromEnv();
+    return service;
+  }
+
+  /** 若存在 BRIEFLY_SILICONFLOW_API_KEY 或 SILICONFLOW_API_KEY，则写入/更新 SiliconFlow 并切到 API 模式 */
+  private async mergePreferredSiliconFlowFromEnv() {
+    const envKey =
+      process.env.BRIEFLY_SILICONFLOW_API_KEY?.trim() ||
+      process.env.SILICONFLOW_API_KEY?.trim();
+    if (!envKey) {
+      return;
+    }
+
+    let resolvedBaseUrl = SILICONFLOW_PREFERRED_BASE;
+    let syncedModels: ProviderModelOption[] = [];
+    try {
+      const synced = await fetchOpenAICompatibleModels(SILICONFLOW_PREFERRED_BASE, envKey);
+      resolvedBaseUrl = synced.resolvedBaseUrl;
+      syncedModels = synced.models;
+    } catch {
+      syncedModels = [];
+    }
+
+    const envFallbackModel = process.env.BRIEFLY_SILICONFLOW_MODEL?.trim();
+    const prevProviders = this.state.settings.apiProviders;
+    const siliconIndex = prevProviders.findIndex(
+      (provider) =>
+        /siliconflow\.cn/i.test(provider.baseUrl) ||
+        /^siliconflow$/i.test(provider.name.trim()),
+    );
+    const previous = siliconIndex >= 0 ? prevProviders[siliconIndex] : undefined;
+    const timestamp = new Date().toISOString();
+
+    let mergedModels =
+      syncedModels.length > 0 ? syncedModels : (previous?.models ?? []);
+    if (mergedModels.length === 0 && envFallbackModel) {
+      mergedModels = [{ id: envFallbackModel }];
+    }
+
+    const defaultModelCandidate =
+      (mergedModels[0]?.id ?? previous?.defaultModel ?? envFallbackModel)?.trim() ||
+      undefined;
+
+    const profile: ApiProviderProfile = {
+      id: previous?.id ?? `provider-${Math.random().toString(36).slice(2, 10)}`,
+      name: "SiliconFlow",
+      baseUrl: resolvedBaseUrl,
+      apiKey: envKey,
+      type: "openai-compatible",
+      defaultModel: defaultModelCandidate,
+      models: mergedModels,
+      importedAt: previous?.importedAt ?? timestamp,
+      lastSyncedAt: syncedModels.length > 0 ? timestamp : previous?.lastSyncedAt,
+    };
+
+    const nextProviders =
+      siliconIndex >= 0
+        ? prevProviders.map((item, index) => (index === siliconIndex ? profile : item))
+        : [profile, ...prevProviders];
+
+    this.state.settings.apiProviders = nextProviders;
+    this.state.settings.activeApiProviderId = profile.id;
+    this.state.settings.provider = "api";
+    this.state.settings = sanitizeModelRouting(hydrateSettings(this.state.settings));
+    await this.persist();
   }
 
   private async persist() {
@@ -1170,6 +1386,20 @@ export class LibraryService {
       await fs.rm(paper.storedPdfPath, { force: true });
     } catch {
       // If the copied PDF is already missing, we still remove the library entry.
+    }
+
+    await this.persist();
+  }
+
+  async touchPaperOpened(paperId: string) {
+    const paper = this.getPaperById(paperId);
+    if (!paper) {
+      throw new Error("Paper not found.");
+    }
+
+    paper.lastOpenedAt = new Date().toISOString();
+    if (paper.status === "inbox") {
+      paper.status = "reading";
     }
 
     await this.persist();
@@ -1303,18 +1533,23 @@ export class LibraryService {
   }
 
   async chat(request: ChatRequest): Promise<ChatResponse> {
+    const focusPaper = request.paperId
+      ? this.getPaperById(request.paperId) ?? undefined
+      : undefined;
     const latestUserMessage =
       [...request.messages].reverse().find((message) => message.role === "user")?.content ?? "";
+    const retrievalQuery =
+      buildChatRetrievalQuery(request.messages) || latestUserMessage.trim();
     const hits =
-      request.useRag && latestUserMessage
-        ? rankQueryHits(latestUserMessage, this.getScopedPapers(request.paperId), 4)
+      request.useRag && retrievalQuery
+        ? rankQueryHits(retrievalQuery, this.getScopedPapers(request.paperId), 5)
         : [];
 
     const startedAt = performance.now();
     const response =
-      (await maybeGenerateApiChat(request, hits, this.state.settings)) ??
-      (await maybeGenerateOllamaChat(request, hits, this.state.settings)) ??
-      buildHeuristicChat(request, hits);
+      (await maybeGenerateApiChat(request, hits, this.state.settings, focusPaper)) ??
+      (await maybeGenerateOllamaChat(request, hits, this.state.settings, focusPaper)) ??
+      buildHeuristicChat(request, hits, focusPaper);
 
     response.latencyMs = Number((performance.now() - startedAt).toFixed(1));
     return response;

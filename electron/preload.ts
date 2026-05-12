@@ -45,7 +45,9 @@ const api = {
   removeApiProvider: (providerId: string) =>
     ipcRenderer.invoke("library:remove-api-provider", providerId) as Promise<LibraryState>,
   openPdf: (paperId: string) =>
-    ipcRenderer.invoke("library:open-pdf", paperId) as Promise<boolean>,
+    ipcRenderer.invoke("library:open-pdf", paperId) as Promise<LibraryState>,
+  revealPdfInFolder: (paperId: string) =>
+    ipcRenderer.invoke("library:reveal-pdf", paperId) as Promise<boolean>,
 };
 
 contextBridge.exposeInMainWorld("brieflyApi", api);

@@ -7,6 +7,7 @@ import type {
   PaperSection,
   ParsedPaper,
 } from "../../src/shared/contracts";
+import { cleanExtractedPageText } from "./textCleanup";
 
 const KNOWN_SECTION_TITLES = [
   "abstract",
@@ -414,7 +415,7 @@ export async function parsePdfDocument(
         lines.push(currentLine.trim());
       }
 
-      const pageText = lines.join("\n");
+      const pageText = cleanExtractedPageText(lines.join("\n"));
       pageTexts.push(pageText);
       return pageText;
     },

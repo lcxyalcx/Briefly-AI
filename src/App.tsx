@@ -2,10 +2,12 @@ import {
   startTransition,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
-import type { ReactNode } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import type {
   ApiProviderDraft,
   ApiProviderProfile,
@@ -32,6 +34,8 @@ type WorkspaceTab =
 type ScopeMode = "paper" | "library";
 type FeedbackTone = "neutral" | "success" | "danger";
 
+const CHAT_PENDING_MESSAGE_ID = "__briefly-chat-pending__";
+
 interface ProviderPreset {
   label: string;
   name: string;
@@ -47,11 +51,38 @@ interface ProviderFormState {
   rawText: string;
 }
 
+const READING_STATUS_ORDER = [
+  "inbox",
+  "reading",
+  "summarized",
+  "archived",
+] as const satisfies readonly ReadingStatus[];
+
+const READING_STATUS_META: Record<ReadingStatus, { label: string; hint: string }> =
+  {
+    inbox: {
+      label: "未读",
+      hint: "尚未开始阅读；导入后默认为未读",
+    },
+    reading: {
+      label: "阅读中",
+      hint: "正在通读或使用 Insight / 检索辅助阅读",
+    },
+    summarized: {
+      label: "已精读",
+      hint: "已完成结构化提炼（如 TL;DR、方法拆解），可作写作素材",
+    },
+    archived: {
+      label: "已归档",
+      hint: "近期不再跟进，可随时改回其它状态",
+    },
+  };
+
 const STATUS_LABELS: Record<ReadingStatus, string> = {
-  inbox: "待阅读",
-  reading: "阅读中",
-  summarized: "已提炼",
-  archived: "已归档",
+  inbox: READING_STATUS_META.inbox.label,
+  reading: READING_STATUS_META.reading.label,
+  summarized: READING_STATUS_META.summarized.label,
+  archived: READING_STATUS_META.archived.label,
 };
 
 const MODE_LABELS: Record<InferenceMode, string> = {
@@ -61,6 +92,12 @@ const MODE_LABELS: Record<InferenceMode, string> = {
 };
 
 const PROVIDER_PRESETS: ProviderPreset[] = [
+  {
+    label: "SiliconFlow",
+    name: "SiliconFlow",
+    baseUrl: "https://api.siliconflow.cn/v1",
+    helper: "硅基流动 · OpenAI-compatible（默认优先）",
+  },
   {
     label: "OpenAI",
     name: "OpenAI",
@@ -72,12 +109,6 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
     name: "OpenRouter",
     baseUrl: "https://openrouter.ai/api/v1",
     helper: "适合多模型选择",
-  },
-  {
-    label: "SiliconFlow",
-    name: "SiliconFlow",
-    baseUrl: "https://api.siliconflow.cn/v1",
-    helper: "国内常见 OpenAI-compatible",
   },
   {
     label: "DeepSeek",
@@ -210,6 +241,69 @@ function StatusBadge({ status }: { status: ReadingStatus }) {
   return <span className={`status-badge status-${status}`}>{STATUS_LABELS[status]}</span>;
 }
 
+function ChatTypingIndicator({ useRag }: { useRag: boolean }) {
+  return (
+    <div className="chat-typing" aria-live="polite" aria-busy="true">
+      <span className="chat-typing-dots" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </span>
+      <span className="chat-typing-label">
+        {useRag ? "正在检索相关片段并生成回复…" : "正在生成回复…"}
+      </span>
+    </div>
+  );
+}
+
+function ToggleSwitchField({
+  id,
+  title,
+  description,
+  checked,
+  disabled,
+  onChange,
+  className,
+}: {
+  id: string;
+  title: string;
+  description?: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (next: boolean) => void;
+  className?: string;
+}) {
+  const rootClass = [
+    "toggle-field",
+    disabled ? "toggle-field-disabled" : "",
+    className ?? "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <label className={rootClass} htmlFor={id}>
+      <span className="toggle-field-body">
+        <span className="toggle-field-title">{title}</span>
+        {description ? <span className="toggle-field-desc">{description}</span> : null}
+      </span>
+      <span className="toggle-switch">
+        <input
+          id={id}
+          type="checkbox"
+          role="switch"
+          className="toggle-switch-input"
+          checked={checked}
+          disabled={disabled}
+          aria-checked={checked}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span className="toggle-switch-track" aria-hidden />
+      </span>
+    </label>
+  );
+}
+
 function MetricTile({
   label,
   value,
@@ -278,10 +372,178 @@ function PromptChip({
   onClick: () => void;
 }) {
   return (
-    <button className="prompt-chip" onClick={onClick}>
+    <button type="button" className="prompt-chip" onClick={onClick}>
       {label}
     </button>
   );
+}
+
+const UI_PREFS_STORAGE_KEY = "briefly.ai.ui";
+
+interface UiPrefs {
+  groundingScope?: ScopeMode;
+  chatUseRag?: boolean;
+  customBackground?: string;
+}
+
+function safeReadPrefs(): UiPrefs | null {
+  try {
+    const raw = localStorage.getItem(UI_PREFS_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    return JSON.parse(raw) as UiPrefs;
+  } catch {
+    return null;
+  }
+}
+
+function saveUiPrefs(prefs: UiPrefs) {
+  try {
+    const merged = {
+      ...(safeReadPrefs() ?? {}),
+      ...prefs,
+    };
+    localStorage.setItem(UI_PREFS_STORAGE_KEY, JSON.stringify(merged));
+  } catch {
+    /* ignore quota / privacy mode */
+  }
+}
+
+const PAPER_LIST_LAYOUT_KEY = "briefly.ai.paperListLayout";
+const RESIZER_GAP = 4;
+
+interface PaperListLayoutPrefs {
+  colArea: number;
+  colStatus: number;
+  colRetrieval: number;
+  libraryWidth: number;
+}
+
+const DEFAULT_PAPER_LIST_LAYOUT: PaperListLayoutPrefs = {
+  colArea: 118,
+  colStatus: 88,
+  colRetrieval: 58,
+  libraryWidth: 400,
+};
+
+const COL_CLAMP = {
+  area: [72, 260] as const,
+  status: [68, 180] as const,
+  retr: [48, 130] as const,
+  library: [300, 640] as const,
+};
+
+function clampNum(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function readPaperListLayout(): PaperListLayoutPrefs {
+  try {
+    const raw = localStorage.getItem(PAPER_LIST_LAYOUT_KEY);
+    if (!raw) {
+      return { ...DEFAULT_PAPER_LIST_LAYOUT };
+    }
+    const p = JSON.parse(raw) as Partial<PaperListLayoutPrefs>;
+    return {
+      colArea: clampNum(
+        Number(p.colArea) || DEFAULT_PAPER_LIST_LAYOUT.colArea,
+        COL_CLAMP.area[0],
+        COL_CLAMP.area[1],
+      ),
+      colStatus: clampNum(
+        Number(p.colStatus) || DEFAULT_PAPER_LIST_LAYOUT.colStatus,
+        COL_CLAMP.status[0],
+        COL_CLAMP.status[1],
+      ),
+      colRetrieval: clampNum(
+        Number(p.colRetrieval) || DEFAULT_PAPER_LIST_LAYOUT.colRetrieval,
+        COL_CLAMP.retr[0],
+        COL_CLAMP.retr[1],
+      ),
+      libraryWidth: clampNum(
+        Number(p.libraryWidth) || DEFAULT_PAPER_LIST_LAYOUT.libraryWidth,
+        COL_CLAMP.library[0],
+        COL_CLAMP.library[1],
+      ),
+    };
+  } catch {
+    return { ...DEFAULT_PAPER_LIST_LAYOUT };
+  }
+}
+
+function savePaperListLayout(layout: PaperListLayoutPrefs) {
+  try {
+    localStorage.setItem(PAPER_LIST_LAYOUT_KEY, JSON.stringify(layout));
+  } catch {
+    /* ignore */
+  }
+}
+
+function redistributePair(
+  snapL: number,
+  snapR: number,
+  delta: number,
+  limL: readonly [number, number],
+  limR: readonly [number, number],
+): [number, number] {
+  let nextL = clampNum(snapL + delta, limL[0], limL[1]);
+  let nextR = snapR + snapL - nextL;
+  if (nextR < limR[0]) {
+    nextR = limR[0];
+    nextL = clampNum(snapL + snapR - nextR, limL[0], limL[1]);
+  } else if (nextR > limR[1]) {
+    nextR = limR[1];
+    nextL = clampNum(snapL + snapR - nextR, limL[0], limL[1]);
+  }
+  return [nextL, nextR];
+}
+
+function useWidePaperTable() {
+  const query = `(min-width: 1241px) and (pointer: fine)`;
+  const [ok, setOk] = useState(
+    typeof window !== "undefined" ? window.matchMedia(query).matches : false,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const update = () => setOk(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  return ok;
+}
+
+function buildPaperGridColumnsFull(layout: PaperListLayoutPrefs) {
+  const { colArea: a, colStatus: s, colRetrieval: r } = layout;
+  const g = RESIZER_GAP;
+  return `minmax(0, 1fr) ${g}px ${a}px ${g}px ${s}px ${g}px ${r}px`;
+}
+
+function buildPaperGridColumnsCompact(layout: PaperListLayoutPrefs) {
+  const { colArea: a, colStatus: s, colRetrieval: r } = layout;
+  return `minmax(0, 1fr) ${a}px ${s}px ${r}px`;
+}
+
+function trySubmitMultilineArea(
+  event: ReactKeyboardEvent<HTMLTextAreaElement>,
+  busy: boolean,
+  onSubmit: () => void | Promise<void>,
+) {
+  if (event.key !== "Enter") {
+    return;
+  }
+  if (event.shiftKey || event.altKey) {
+    return;
+  }
+  if (event.nativeEvent.isComposing) {
+    return;
+  }
+  event.preventDefault();
+  if (busy) {
+    return;
+  }
+  void onSubmit();
 }
 
 function App() {
@@ -296,19 +558,33 @@ function App() {
   const [askQuestion, setAskQuestion] = useState("");
   const [askResult, setAskResult] = useState<AskResponse | null>(null);
   const [noteDraft, setNoteDraft] = useState("");
+  const [tagDraft, setTagDraft] = useState("");
   const [chatDraft, setChatDraft] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatUseRag, setChatUseRag] = useState(true);
-  const [groundingScope, setGroundingScope] = useState<ScopeMode>("paper");
+  const [chatUseRag, setChatUseRag] = useState(() => {
+    const prefs = safeReadPrefs();
+    return typeof prefs?.chatUseRag === "boolean" ? prefs.chatUseRag : true;
+  });
+  const [customBackground, setCustomBackground] = useState(() => {
+    const prefs = safeReadPrefs();
+    return prefs?.customBackground?.trim() ?? "";
+  });
+  const [groundingScope, setGroundingScope] = useState<ScopeMode>(() => {
+    const prefs = safeReadPrefs();
+    return prefs?.groundingScope === "library" ? "library" : "paper";
+  });
   const [settingsDraft, setSettingsDraft] = useState<UserSettings | null>(null);
   const [providerForm, setProviderForm] = useState<ProviderFormState>(createEmptyProviderForm());
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [banner, setBanner] = useState(
-    "欢迎来到 Briefly AI。先导入一批 PDF，再用右侧 Insight Card 快速判断哪些论文值得精读。",
+  const [openingPdfId, setOpeningPdfId] = useState<string | null>(null);
+  const [paperListLayout, setPaperListLayout] = useState<PaperListLayoutPrefs>(() =>
+    readPaperListLayout(),
   );
+  const [banner, setBanner] = useState("导入 PDF；悬停列表项可打开或删除。");
   const [bannerTone, setBannerTone] = useState<FeedbackTone>("neutral");
   const deferredKeyword = useDeferredValue(filterKeyword);
   const chatStreamRef = useRef<HTMLDivElement | null>(null);
+  const widePaperTable = useWidePaperTable();
 
   function requireApi() {
     const api = window.brieflyApi;
@@ -355,11 +631,40 @@ function App() {
   }, [library, selectedPaperId]);
 
   useEffect(() => {
+    setTagDraft("");
+  }, [selectedPaperId]);
+
+  useLayoutEffect(() => {
     if (!chatStreamRef.current) {
       return;
     }
     chatStreamRef.current.scrollTop = chatStreamRef.current.scrollHeight;
   }, [chatMessages]);
+
+  useEffect(() => {
+    saveUiPrefs({ groundingScope, chatUseRag, customBackground });
+  }, [groundingScope, chatUseRag, customBackground]);
+
+  useEffect(() => {
+    const bg = customBackground.trim();
+    if (!bg) {
+      document.documentElement.style.removeProperty("--app-bg");
+      return;
+    }
+    document.documentElement.style.setProperty("--app-bg", bg);
+  }, [customBackground]);
+
+  useEffect(() => {
+    savePaperListLayout(paperListLayout);
+  }, [paperListLayout]);
+
+  const paperGridColumns = useMemo(
+    () =>
+      widePaperTable
+        ? buildPaperGridColumnsFull(paperListLayout)
+        : buildPaperGridColumnsCompact(paperListLayout),
+    [widePaperTable, paperListLayout],
+  );
 
   const filteredPapers =
     library?.papers.filter((paper) => {
@@ -382,8 +687,161 @@ function App() {
   const activeApiProvider = getProviderById(settingsDraft);
   const activeApiModels = activeApiProvider?.models ?? [];
   const latestAssistantMessage =
-    [...chatMessages].reverse().find((message) => message.role === "assistant") ?? null;
+    [...chatMessages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "assistant" && message.id !== CHAT_PENDING_MESSAGE_ID,
+      ) ?? null;
   const scopedPaperId = buildScopePaperId(groundingScope, selectedPaper);
+
+  const electronAvailable = Boolean(window.brieflyApi);
+  const libraryIsEmpty = Boolean(library && library.papers.length === 0);
+  const blockImport =
+    !electronAvailable || busyAction === "loading" || busyAction === "import";
+
+  function startLibrarySplitDrag(event: React.MouseEvent) {
+    event.preventDefault();
+    const snapshot = { ...paperListLayout };
+    const startX = event.clientX;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      setPaperListLayout((piece) => ({
+        ...piece,
+        libraryWidth: clampNum(
+          snapshot.libraryWidth + dx,
+          COL_CLAMP.library[0],
+          COL_CLAMP.library[1],
+        ),
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.removeProperty("cursor");
+      document.body.style.removeProperty("user-select");
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function startPaperColDrag(
+    kind: "areaFromTitle" | "areaStatus" | "statusRetr",
+    event: React.MouseEvent,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const snapshot = { ...paperListLayout };
+    const startX = event.clientX;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      setPaperListLayout((piece) => {
+        if (kind === "areaFromTitle") {
+          return {
+            ...piece,
+            colArea: clampNum(snapshot.colArea + dx, COL_CLAMP.area[0], COL_CLAMP.area[1]),
+          };
+        }
+        if (kind === "areaStatus") {
+          const [colArea, colStatus] = redistributePair(
+            snapshot.colArea,
+            snapshot.colStatus,
+            dx,
+            COL_CLAMP.area,
+            COL_CLAMP.status,
+          );
+          return { ...piece, colArea, colStatus };
+        }
+        const [colStatus, colRetrieval] = redistributePair(
+          snapshot.colStatus,
+          snapshot.colRetrieval,
+          dx,
+          COL_CLAMP.status,
+          COL_CLAMP.retr,
+        );
+        return { ...piece, colStatus, colRetrieval };
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.removeProperty("cursor");
+      document.body.style.removeProperty("user-select");
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function navigatePaperSelection(delta: number) {
+    if (filteredPapers.length === 0) {
+      return;
+    }
+
+    let index = filteredPapers.findIndex((paper) => paper.id === selectedPaperId);
+    if (index === -1) {
+      index = delta > 0 ? -1 : 0;
+    }
+
+    const nextIndex = Math.min(
+      filteredPapers.length - 1,
+      Math.max(0, index + delta),
+    );
+    const nextPaper = filteredPapers[nextIndex];
+    if (!nextPaper) {
+      return;
+    }
+
+    setSelectedPaperId(nextPaper.id);
+    setSearchResult(null);
+    setAskResult(null);
+  }
+
+  function handlePaperListKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    const narrowTarget = event.target;
+    if (narrowTarget instanceof HTMLInputElement || narrowTarget instanceof HTMLTextAreaElement) {
+      return;
+    }
+    if (narrowTarget instanceof HTMLSelectElement) {
+      return;
+    }
+
+    if (event.altKey || event.metaKey || event.ctrlKey) {
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      navigatePaperSelection(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      navigatePaperSelection(-1);
+    }
+  }
+
+  function handleLibraryFilterKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (event.key !== "Escape") {
+      return;
+    }
+    event.preventDefault();
+    setFilterKeyword("");
+  }
+
+  function handleSearchKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    trySubmitMultilineArea(event, busyAction === "search", handleSearch);
+  }
+
+  function handleAskKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    trySubmitMultilineArea(event, busyAction === "ask", handleAsk);
+  }
+
+  function handleChatKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    trySubmitMultilineArea(event, busyAction === "chat", handleChatSend);
+  }
 
   function setFeedback(message: string, tone: FeedbackTone) {
     setBanner(message);
@@ -461,6 +919,29 @@ function App() {
     } finally {
       setBusyAction(null);
     }
+  }
+
+  async function commitTagDraft() {
+    if (!selectedPaper) {
+      return;
+    }
+    const nextTag = tagDraft.trim();
+    if (!nextTag) {
+      return;
+    }
+    const nextTags = [...selectedPaper.tags, nextTag].filter(
+      (value, index, list) => value && list.indexOf(value) === index,
+    );
+    setTagDraft("");
+    await patchPaper(selectedPaper.id, { tags: nextTags }, "标签已更新。");
+  }
+
+  async function removeTag(tag: string) {
+    if (!selectedPaper) {
+      return;
+    }
+    const nextTags = selectedPaper.tags.filter((item) => item !== tag);
+    await patchPaper(selectedPaper.id, { tags: nextTags }, "标签已更新。");
   }
 
   async function handleRegenerateBrief(paperId: string) {
@@ -583,36 +1064,44 @@ function App() {
       content: chatDraft.trim(),
       createdAt: new Date().toISOString(),
     };
-    const nextMessages = [...chatMessages, userMessage];
+    const baseThread = chatMessages.filter((message) => message.id !== CHAT_PENDING_MESSAGE_ID);
+    const threadForModel = [...baseThread, userMessage];
+    const pendingAssistant: ChatMessage = {
+      id: CHAT_PENDING_MESSAGE_ID,
+      role: "assistant",
+      content: "",
+      createdAt: new Date().toISOString(),
+      model: "pending",
+    };
 
-    setChatMessages(nextMessages);
+    setChatMessages([...threadForModel, pendingAssistant]);
     setChatDraft("");
     setBusyAction("chat");
 
     try {
       const result = await requireApi().chat({
-        messages: nextMessages.map((message) => ({
+        messages: threadForModel.map((message) => ({
           role: message.role,
           content: message.content,
         })),
-        paperId: chatUseRag ? scopedPaperId : undefined,
+        paperId: scopedPaperId,
         useRag: chatUseRag,
       });
 
-      setChatMessages([...nextMessages, result.reply]);
+      setChatMessages([...threadForModel, result.reply]);
       setActiveTab("chat");
       setFeedback(
         chatUseRag
           ? groundingScope === "paper"
-            ? "机器人正在基于当前论文的检索证据继续回答。"
-            : "机器人正在基于整个文献库的检索证据继续回答。"
-          : "机器人已切换到自由学术讨论模式。",
+            ? "已基于当前论文的检索证据生成回复。"
+            : "已基于整个文献库的检索证据生成回复。"
+          : "已完成本轮自由对话回复。",
         "success",
       );
     } catch (error) {
       const errorMessage = describeError(error);
       setChatMessages([
-        ...nextMessages,
+        ...threadForModel,
         {
           id: `chat-error-${Date.now()}`,
           role: "assistant",
@@ -627,16 +1116,37 @@ function App() {
     }
   }
 
+  async function handleOpenPaperPdf(paperId: string) {
+    setOpeningPdfId(paperId);
+    setBusyAction("paper-open");
+    try {
+      await syncState(
+        requireApi().openPdf(paperId),
+        "已使用本机默认应用打开本地 PDF。若状态为「未读」，会自动记为「阅读中」并更新最近打开时间。",
+      );
+    } catch (error) {
+      setFeedback(`打开 PDF 失败：${describeError(error)}`, "danger");
+    } finally {
+      setOpeningPdfId(null);
+      setBusyAction(null);
+    }
+  }
+
   async function handleOpenPdf() {
     if (!selectedPaper) {
       setFeedback("先在中间文献列表里选择一篇论文。", "neutral");
       return;
     }
 
+    await handleOpenPaperPdf(selectedPaper.id);
+  }
+
+  async function handleRevealPaperPdf(paperId: string) {
     try {
-      await requireApi().openPdf(selectedPaper.id);
+      await requireApi().revealPdfInFolder(paperId);
+      setFeedback("已在文件管理器中定位到本地 PDF。", "success");
     } catch (error) {
-      setFeedback(`打开 PDF 失败：${describeError(error)}`, "danger");
+      setFeedback(`无法打开所在文件夹：${describeError(error)}`, "danger");
     }
   }
 
@@ -772,26 +1282,25 @@ function App() {
         <div className="card brand-card">
           <div className="brand-topline">
             <span className="eyebrow">Briefly AI</span>
-            <span className="eyebrow soft-eyebrow">Local Literature Desk</span>
           </div>
-          <h1>Briefly AI 本地文献工作台，围绕 Insight Card 深度阅读论文。</h1>
-          <p>
-            左边做筛选与收藏，中间快速定位文献，右边直接进入摘要、检索、问答和聊天。
+          <h1>文献工作台</h1>
+          <p className="brand-tagline">
+            Insight / 检索 / 问答，数据在本地。
           </p>
           <button
+            type="button"
             className="primary-button"
             onClick={handleImport}
-            disabled={busyAction === "import"}
+            disabled={blockImport}
           >
-            {busyAction === "import" ? "正在导入…" : "导入 PDF"}
+            {busyAction === "import"
+              ? "正在导入…"
+              : busyAction === "loading" && electronAvailable
+                ? "加载文献库…"
+                : !electronAvailable
+                  ? "桌面版导入"
+                  : "导入 PDF"}
           </button>
-          <div className="flow-strip">
-            <span>导入</span>
-            <span>解析</span>
-            <span>提炼</span>
-            <span>检索</span>
-            <span>复用</span>
-          </div>
         </div>
 
         <div className="card sidebar-card">
@@ -842,9 +1351,9 @@ function App() {
 
         <div className="card sidebar-card">
           <div className="sidebar-section-head">
-            <h2>模型状态</h2>
-            <button className="text-button" onClick={() => setActiveTab("settings")}>
-              去设置
+            <h2>模型</h2>
+            <button type="button" className="text-button" onClick={() => setActiveTab("settings")}>
+              设置
             </button>
           </div>
           <div className="mini-stack">
@@ -866,59 +1375,97 @@ function App() {
             </div>
           </div>
           <div className="sidebar-cta-row">
-            <button className="secondary-button" onClick={() => setActiveTab("search")}>
-              语义检索
+            <button type="button" className="secondary-button" onClick={() => setActiveTab("search")}>
+              检索
             </button>
-            <button className="secondary-button" onClick={() => setActiveTab("chat")}>
-              机器人
+            <button type="button" className="secondary-button" onClick={() => setActiveTab("chat")}>
+              对话
             </button>
           </div>
         </div>
       </aside>
 
       <main className="workspace">
-        <div className={`banner card banner-${bannerTone}`}>
-          <div>
-            <strong>状态</strong>
-            <p>{banner}</p>
+        {!electronAvailable ? (
+          <div className="preview-mode-strip card" role="note">
+            <div>
+              <strong className="preview-mode-title">浏览器预览模式</strong>
+              <p className="preview-mode-copy">
+                Electron 未注入，仅能预览布局。桌面端请运行
+                <span className="mono preview-mode-shell"> npm run dev </span>
+                。
+              </p>
+            </div>
           </div>
-          <span className="mono">
+        ) : null}
+
+        <div className={`banner card banner-${bannerTone} banner-compact`}>
+          <p className="banner-line">{banner}</p>
+          <span className="mono banner-metrics">
             {library
-              ? `${library.metrics.documentCount} papers / ${library.metrics.indexedChunkCount} chunks`
-              : "准备中"}
+              ? `${library.metrics.documentCount} docs · ${library.metrics.indexedChunkCount} ch`
+              : "…"}
           </span>
         </div>
 
         <div className="desktop-grid">
-          <section className="library-pane card">
+          <section
+            className="library-pane card"
+            style={{ width: paperListLayout.libraryWidth, flexShrink: 0 }}
+          >
             <div className="pane-head">
               <div>
-                <span className="eyebrow">Library Browser</span>
-                <h2>文献列表</h2>
+                <h2 className="pane-title-plain">列表</h2>
               </div>
-              <button className="secondary-button" onClick={handleImport}>
-                新增导入
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={handleImport}
+                disabled={blockImport}
+              >
+                {busyAction === "import" ? "导入中…" : "导入"}
               </button>
             </div>
 
             <div className="library-toolbar">
               <input
-                placeholder="按标题、作者、摘要、标签搜索"
+                placeholder="标题、摘要、标签…"
                 value={filterKeyword}
                 onChange={(event) => setFilterKeyword(event.target.value)}
+                onKeyDown={handleLibraryFilterKeyDown}
+                aria-label="筛选文献列表"
               />
+              <p className="toolbar-hint toolbar-hint-tight">
+                {widePaperTable ? (
+                  <>
+                    表头竖线为列宽分割线，可拖拽；条目悬停出操作。<kbd>↑</kbd>
+                    <kbd>↓</kbd> 切换 · Esc 清空搜索。
+                  </>
+                ) : (
+                  <>
+                    <kbd>↑</kbd>
+                    <kbd>↓</kbd> 切换条目 · Esc 清空。
+                  </>
+                )}
+              </p>
               <div className="toolbar-row">
                 <select
                   value={statusFilter}
                   onChange={(event) =>
                     setStatusFilter(event.target.value as ReadingStatus | "all")
                   }
+                  aria-label="按阅读状态筛选"
                 >
                   <option value="all">全部状态</option>
-                  <option value="inbox">待阅读</option>
-                  <option value="reading">阅读中</option>
-                  <option value="summarized">已提炼</option>
-                  <option value="archived">已归档</option>
+                  {READING_STATUS_ORDER.map((value) => (
+                    <option
+                      key={value}
+                      value={value}
+                      title={READING_STATUS_META[value].hint}
+                    >
+                      {STATUS_LABELS[value]}
+                    </option>
+                  ))}
                 </select>
                 <select
                   value={tagFilter}
@@ -934,54 +1481,198 @@ function App() {
               </div>
             </div>
 
-            <div className="paper-table-head">
-              <span>文献</span>
-              <span>研究方向</span>
-              <span>状态</span>
-              <span>检索片段</span>
+            <div
+              className="paper-table-head"
+              style={{ gridTemplateColumns: paperGridColumns }}
+            >
+              {widePaperTable ? (
+                <>
+                  <span className="paper-head-main">文献</span>
+                  <button
+                    type="button"
+                    className="col-resize-handle"
+                    aria-label="拖动：加宽或缩窄研究方向列"
+                    tabIndex={-1}
+                    onMouseDown={(event) => startPaperColDrag("areaFromTitle", event)}
+                  />
+                  <span className="paper-head-slot paper-head-area">方向</span>
+                  <button
+                    type="button"
+                    className="col-resize-handle"
+                    aria-label="拖动：在研究方向与阅读状态之间分配宽度"
+                    tabIndex={-1}
+                    onMouseDown={(event) => startPaperColDrag("areaStatus", event)}
+                  />
+                  <span className="paper-head-slot paper-head-meta">状态</span>
+                  <button
+                    type="button"
+                    className="col-resize-handle"
+                    aria-label="拖动：在阅读状态与检索列之间分配宽度"
+                    tabIndex={-1}
+                    onMouseDown={(event) => startPaperColDrag("statusRetr", event)}
+                  />
+                  <span className="paper-head-slot paper-head-meta paper-head-end">
+                    检索
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="paper-head-main">文献</span>
+                  <span className="paper-head-slot paper-head-area">方向</span>
+                  <span className="paper-head-slot paper-head-meta">状态</span>
+                  <span className="paper-head-slot paper-head-meta paper-head-end">
+                    检索
+                  </span>
+                </>
+              )}
             </div>
 
-            <div className="paper-table">
+            <div
+              className="paper-table-shell"
+              role="region"
+              aria-label="文献列表。在当前列表内可按上、下方向键切换选中的论文。"
+              onKeyDownCapture={handlePaperListKeyDown}
+            >
+              <div className="paper-table">
               {filteredPapers.length === 0 ? (
                 <div className="empty-state">
-                  <h3>当前筛选下没有文献</h3>
-                  <p>试着清空标签和状态筛选，或者先导入新的 PDF。</p>
+                  <h3>{libraryIsEmpty ? "文献库还是空的" : "当前筛选下没有文献"}</h3>
+                  <p>
+                    {libraryIsEmpty
+                      ? "使用上方「导入 PDF」或右侧「新增导入」加入第一篇文献。"
+                      : "试着清空左侧标签或状态筛选，也可以调整上方关键词。"}
+                  </p>
                 </div>
               ) : (
                 filteredPapers.map((paper) => (
-                  <button
+                  <div
                     key={paper.id}
+                    id={`paper-row-${paper.id}`}
                     className={`paper-row ${paper.id === selectedPaper?.id ? "active" : ""}`}
-                    onClick={() => {
-                      setSelectedPaperId(paper.id);
-                      setSearchResult(null);
-                      setAskResult(null);
-                    }}
+                    role="presentation"
                   >
-                    <div className="paper-main-cell">
-                      <strong>{paper.title}</strong>
-                      <p>
-                        {(paper.authors.slice(0, 3).join(", ") || "作者未识别")}
-                        {paper.year ? ` · ${paper.year}` : ""}
-                      </p>
-                      <span>{paper.abstract.slice(0, 118) || "暂无摘要。打开原文可继续查看。"} </span>
+                    <button
+                      type="button"
+                      className="paper-row-body"
+                      style={{ gridTemplateColumns: paperGridColumns }}
+                      aria-current={paper.id === selectedPaper?.id ? "true" : undefined}
+                      onClick={() => {
+                        setSelectedPaperId(paper.id);
+                        setSearchResult(null);
+                        setAskResult(null);
+                      }}
+                    >
+                      <div className="paper-main-cell">
+                        <strong>{paper.title}</strong>
+                        {paper.abstract ? (
+                          <span className="paper-excerpt">{paper.abstract}</span>
+                        ) : (
+                          <span className="paper-excerpt paper-excerpt-empty">暂无摘要</span>
+                        )}
+                      </div>
+                      {widePaperTable ? <span className="paper-col-gutter" aria-hidden /> : null}
+                      <span className="paper-area-cell">{paper.researchArea}</span>
+                      {widePaperTable ? <span className="paper-col-gutter" aria-hidden /> : null}
+                      <div className="paper-status-cell">
+                        <StatusBadge status={paper.status} />
+                      </div>
+                      {widePaperTable ? <span className="paper-col-gutter" aria-hidden /> : null}
+                      <div
+                        className="paper-chunk-cell"
+                        title={`${paper.chunks.length} 个检索片段 · ${paper.references.length} 条参考文献`}
+                      >
+                        <strong>{paper.chunks.length}</strong>
+                        <span className="chunk-slash">/</span>
+                        <span className="chunk-count-secondary">{paper.references.length}</span>
+                      </div>
+                    </button>
+                    <div
+                      className="paper-actions-cell"
+                      role="toolbar"
+                      aria-label={`「${paper.title}」：打开 PDF、定位文件、删除文献`}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        className="paper-action"
+                        disabled={blockImport || busyAction === "paper-open"}
+                        title="使用系统默认应用打开本地复制的 PDF"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          if (!electronAvailable) {
+                            setFeedback(
+                              "当前为预览模式，请在 Electron 桌面版中打开本地 PDF。",
+                              "neutral",
+                            );
+                            return;
+                          }
+                          void handleOpenPaperPdf(paper.id);
+                        }}
+                      >
+                        {openingPdfId === paper.id ? "⋯" : "打开"}
+                      </button>
+                      <button
+                        type="button"
+                        className="paper-action"
+                        title="访达或资源管理器"
+                        disabled={!electronAvailable}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleRevealPaperPdf(paper.id);
+                        }}
+                      >
+                        定位
+                      </button>
+                      <button
+                        type="button"
+                        className="paper-action paper-action-delete"
+                        title="从文献库移除并删除本地 PDF 副本"
+                        disabled={busyAction === "paper-remove"}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleRemovePaper(paper.id, paper.title);
+                        }}
+                      >
+                        删除
+                      </button>
                     </div>
-                    <span className="paper-area-cell">{paper.researchArea}</span>
-                    <div className="paper-status-cell">
-                      <StatusBadge status={paper.status} />
-                    </div>
-                    <div className="paper-chunk-cell">
-                      <strong>{paper.chunks.length}</strong>
-                      <span>{paper.references.length} refs</span>
-                    </div>
-                  </button>
+                  </div>
                 ))
               )}
+              </div>
             </div>
           </section>
 
+          <div
+            className="pane-splitter-vertical"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="拖动调整列表区与阅读区宽度"
+            onMouseDown={startLibrarySplitDrag}
+          />
+
           <section className="reader-pane card">
-            {selectedPaper ? (
+            {libraryIsEmpty ? (
+              <div className="empty-state large">
+                <h2>从这里搭建你的文献库</h2>
+                <p className="empty-lead">
+                  Briefly AI 会把 PDF 元数据与正文片段留在本地索引里，让你在检索、问答和聊天里都能回溯到出处。
+                </p>
+                <button
+                  type="button"
+                  className="primary-button empty-primary"
+                  onClick={handleImport}
+                  disabled={blockImport}
+                >
+                  {busyAction === "import" ? "正在导入…" : "导入第一批 PDF"}
+                </button>
+                {!electronAvailable ? (
+                  <p className="empty-footnote">
+                    当前为预览模式：请改用桌面端启动后才能真正导入文献。
+                  </p>
+                ) : null}
+              </div>
+            ) : selectedPaper ? (
               <>
                 <div className="reader-head">
                   <div className="reader-copy">
@@ -989,24 +1680,46 @@ function App() {
                     <h2>{selectedPaper.title}</h2>
                     <p>
                       {selectedPaper.authors.join(", ") || "作者未识别"} · {selectedPaper.pageCount} 页 ·{" "}
-                      {compactNumber(selectedPaper.wordCount)} 词 · 导入于 {formatDate(selectedPaper.importedAt)}
+                      {compactNumber(selectedPaper.wordCount)} 词 · 导入于{" "}
+                      {formatDate(selectedPaper.importedAt)}
+                      {selectedPaper.lastOpenedAt
+                        ? ` · 最近打开 ${formatDate(selectedPaper.lastOpenedAt)}`
+                        : ""}
                     </p>
                   </div>
                   <div className="reader-actions">
-                    <button className="secondary-button" onClick={handleOpenPdf}>
-                      打开原文
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void handleOpenPdf()}
+                      disabled={
+                        !electronAvailable || busyAction === "paper-open" || busyAction === "loading"
+                      }
+                    >
+                      {openingPdfId === selectedPaper.id ? "打开中…" : "打开本地 PDF"}
                     </button>
                     <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void handleRevealPaperPdf(selectedPaper.id)}
+                      disabled={!electronAvailable || busyAction === "loading"}
+                      title="访达 / 资源管理器"
+                    >
+                      在文件夹中显示
+                    </button>
+                    <button
+                      type="button"
                       className="secondary-button"
                       onClick={() => handleRegenerateBrief(selectedPaper.id)}
                     >
                       {busyAction === "brief" ? "生成中…" : "刷新 Insight"}
                     </button>
                     <button
+                      type="button"
                       className="secondary-button danger-button"
                       onClick={() => handleRemovePaper(selectedPaper.id, selectedPaper.title)}
                     >
-                      {busyAction === "paper-remove" ? "删除中…" : "删除文档"}
+                      {busyAction === "paper-remove" ? "删除中…" : "删除文献"}
                     </button>
                   </div>
                 </div>
@@ -1028,36 +1741,51 @@ function App() {
                     <span>阅读状态</span>
                     <select
                       value={selectedPaper.status}
+                      title={READING_STATUS_META[selectedPaper.status].hint}
                       onChange={(event) =>
                         void patchPaper(selectedPaper.id, {
                           status: event.target.value as ReadingStatus,
                         })
                       }
+                      aria-label="标准阅读状态"
                     >
-                      <option value="inbox">待阅读</option>
-                      <option value="reading">阅读中</option>
-                      <option value="summarized">已提炼</option>
-                      <option value="archived">已归档</option>
+                      {READING_STATUS_ORDER.map((value) => (
+                        <option key={value} value={value} title={READING_STATUS_META[value].hint}>
+                          {STATUS_LABELS[value]}
+                        </option>
+                      ))}
                     </select>
                   </label>
                   <label className="field inline-field wide-field">
                     <span>关键词标签</span>
-                    <input
-                      defaultValue={selectedPaper.tags.join(", ")}
-                      key={`${selectedPaper.id}-tags`}
-                      onBlur={(event) =>
-                        void patchPaper(
-                          selectedPaper.id,
-                          {
-                            tags: event.target.value
-                              .split(",")
-                              .map((item) => item.trim())
-                              .filter(Boolean),
-                          },
-                          "标签已更新。",
-                        )
-                      }
-                    />
+                    <div className="tag-editor">
+                      <div className="tag-editor-list">
+                        {selectedPaper.tags.map((tag) => (
+                          <span key={tag} className="tag-token">
+                            {tag}
+                            <button
+                              type="button"
+                              className="tag-token-remove"
+                              onClick={() => void removeTag(tag)}
+                              aria-label={`删除标签 ${tag}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                      <input
+                        value={tagDraft}
+                        onChange={(event) => setTagDraft(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && !event.shiftKey) {
+                            event.preventDefault();
+                            void commitTagDraft();
+                          }
+                        }}
+                        placeholder="输入标签后按回车新增"
+                      />
+                    </div>
                   </label>
                 </div>
 
@@ -1147,18 +1875,25 @@ function App() {
 
                     {activeTab === "search" ? (
                       <div className="stack-panel">
+                        <p className="rag-scope-hint">
+                          语义检索只返回与查询相关的<strong>正文段落摘录</strong>
+                          （PDF 文本层，非表格结构化还原）。需要核对表格或精确数字时请打开对应 PDF 页面。
+                        </p>
                         <div className="action-card">
                           <textarea
                             rows={3}
-                            placeholder="例如：作者如何缓解长上下文检索中的噪声片段问题？"
+                            placeholder="例如：作者如何缓解长上下文检索中的噪声片段问题？Enter 提交 · Shift+Enter 换行"
                             value={searchQuery}
+                            disabled={!electronAvailable || busyAction === "search"}
                             onChange={(event) => setSearchQuery(event.target.value)}
+                            onKeyDown={handleSearchKeyDown}
                           />
                           <div className="action-footer">
                             <div className="inline-controls">
                               <span className="mono">Retrieval Scope</span>
                               <select
                                 value={groundingScope}
+                                disabled={busyAction === "search"}
                                 onChange={(event) =>
                                   setGroundingScope(event.target.value as ScopeMode)
                                 }
@@ -1167,63 +1902,97 @@ function App() {
                                 <option value="library">整个文献库</option>
                               </select>
                             </div>
-                            <button className="primary-button" onClick={handleSearch}>
+                            <button
+                              type="button"
+                              className="primary-button"
+                              disabled={!electronAvailable || busyAction === "search"}
+                              aria-busy={busyAction === "search"}
+                              onClick={handleSearch}
+                            >
                               {busyAction === "search" ? "检索中…" : "执行语义检索"}
                             </button>
                           </div>
                         </div>
 
-                        {searchResult ? (
-                          <>
-                            <div className="comparison-strip">
-                              <MetricTile
-                                label="混合检索最高分"
-                                value={compactNumber(searchResult.hybridTopScore)}
-                                hint="向量相似度 + 关键词覆盖"
-                              />
-                              <MetricTile
-                                label="关键词基线"
-                                value={compactNumber(searchResult.keywordBaselineTopScore)}
-                                hint="只看字面命中"
-                              />
-                              <MetricTile
-                                label="响应时间"
-                                value={`${compactNumber(searchResult.latencyMs)} ms`}
-                                hint="本机检索耗时"
-                              />
+                        {busyAction === "search" ? (
+                          <div className="rag-loading-panel" aria-busy="true">
+                            <div className="rag-loading-strip">
+                              <span className="skeleton-block skeleton-line wide" />
+                              <span className="skeleton-block skeleton-line narrow" />
+                              <span className="skeleton-block skeleton-line medium" />
                             </div>
+                            <div className="rag-loading-cards">
+                              <article className="panel-card result-card skeleton-card">
+                                <span className="skeleton-block skeleton-line wide" />
+                                <span className="skeleton-block skeleton-line full" />
+                                <span className="skeleton-block skeleton-line full short" />
+                              </article>
+                              <article className="panel-card result-card skeleton-card">
+                                <span className="skeleton-block skeleton-line wide" />
+                                <span className="skeleton-block skeleton-line full" />
+                              </article>
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {busyAction !== "search" &&
+                          (searchResult ? (
+                            <>
+                              <div className="comparison-strip">
+                                <MetricTile
+                                  label="混合检索最高分"
+                                  value={compactNumber(searchResult.hybridTopScore)}
+                                  hint="向量相似度 + 关键词覆盖"
+                                />
+                                <MetricTile
+                                  label="关键词基线"
+                                  value={compactNumber(searchResult.keywordBaselineTopScore)}
+                                  hint="只看字面命中"
+                                />
+                                <MetricTile
+                                  label="响应时间"
+                                  value={`${compactNumber(searchResult.latencyMs)} ms`}
+                                  hint="本机检索耗时"
+                                />
+                              </div>
                             <div className="result-list">
                               {searchResult.hits.map((hit, index) => (
                                 <article key={hit.chunkId} className="panel-card result-card">
                                   <div className="result-meta">
-                                    <strong>Top {index + 1}</strong>
+                                    <strong>段落 {index + 1}</strong>
                                     <span className="mono">
                                       {hit.paperTitle} · p.{hit.page}
                                     </span>
                                   </div>
-                                  <h3>{hit.sectionTitle || "相关段落"}</h3>
+                                  <h3>{hit.sectionTitle || "相关正文段落"}</h3>
                                   <p>{hit.excerpt}</p>
                                 </article>
                               ))}
+                              </div>
+                            </>
+                          ) : (
+                            <div className="empty-state secondary">
+                              <h3>还没有检索结果</h3>
+                              <p>可以先用问题或方法关键词试一下，看看哪几个段落最值得回看。</p>
                             </div>
-                          </>
-                        ) : (
-                          <div className="empty-state secondary">
-                            <h3>还没有检索结果</h3>
-                            <p>可以先用问题或方法关键词试一下，看看哪几个段落最值得回看。</p>
-                          </div>
-                        )}
+                          ))}
                       </div>
                     ) : null}
 
                     {activeTab === "qa" ? (
                       <div className="stack-panel">
+                        <p className="rag-scope-hint">
+                          RAG 问答会依据检索到的<strong>正文摘录</strong>作答，侧重帮你理解文意；涉及表格或精确数值时，请结合引用页码对照
+                          PDF。
+                        </p>
                         <div className="action-card">
                           <textarea
                             rows={4}
-                            placeholder="例如：这篇论文的创新点和实验设计是否足以支撑结论？"
+                            placeholder="例如：这篇论文的创新点和实验设计是否足以支撑结论？Enter 提交 · Shift+Enter 换行"
                             value={askQuestion}
+                            disabled={!electronAvailable || busyAction === "ask"}
                             onChange={(event) => setAskQuestion(event.target.value)}
+                            onKeyDown={handleAskKeyDown}
                           />
                           <div className="action-footer">
                             <div className="inline-controls">
@@ -1232,6 +2001,7 @@ function App() {
                               </span>
                               <select
                                 value={groundingScope}
+                                disabled={busyAction === "ask"}
                                 onChange={(event) =>
                                   setGroundingScope(event.target.value as ScopeMode)
                                 }
@@ -1240,11 +2010,31 @@ function App() {
                                 <option value="library">整个文献库</option>
                               </select>
                             </div>
-                            <button className="primary-button" onClick={handleAsk}>
+                            <button
+                              type="button"
+                              className="primary-button"
+                              disabled={!electronAvailable || busyAction === "ask"}
+                              aria-busy={busyAction === "ask"}
+                              onClick={handleAsk}
+                            >
                               {busyAction === "ask" ? "回答中…" : "开始问答"}
                             </button>
                           </div>
                         </div>
+
+                        {busyAction === "ask" ? (
+                          <article className="panel-card qa-loading-card" aria-busy="true">
+                            <div className="result-meta">
+                              <strong>回答</strong>
+                              <span className="mono">生成中…</span>
+                            </div>
+                            <div className="qa-loading-body">
+                              <span className="skeleton-block skeleton-line full" />
+                              <span className="skeleton-block skeleton-line full" />
+                              <span className="skeleton-block skeleton-line medium" />
+                            </div>
+                          </article>
+                        ) : null}
 
                         {askResult ? (
                           <article className="panel-card answer-card">
@@ -1264,36 +2054,46 @@ function App() {
                               ))}
                             </div>
                           </article>
-                        ) : (
+                        ) : busyAction !== "ask" ? (
                           <div className="empty-state secondary">
                             <h3>还没有问答结果</h3>
-                            <p>可以直接问方法、对比、局限性或实验可信度，系统会尽量给出带出处回答。</p>
+                            <p>
+                              可以直接问方法、对比、局限性或实验可信度，系统会尽量给出带出处回答。
+                            </p>
                           </div>
-                        )}
+                        ) : null}
                       </div>
                     ) : null}
 
                     {activeTab === "chat" ? (
                       <div className="stack-panel">
-                        <article className="panel-card">
+                        <p className="rag-scope-hint">
+                          开启 RAG 时，助手依据<strong>检索到的正文段落</strong>
+                          解读论文；若片段疑似表格提取错乱，会提示你到 PDF 原页核对，而不是复述乱码。
+                        </p>
+                        <article className="panel-card chat-panel-card">
                           <div className="section-header">
                             <h3>聊天机器人</h3>
                             <span>{getModelLabel(settingsDraft, "chatModel")}</span>
                           </div>
                           <div className="chat-toolbar">
-                            <label className="checkbox-field compact-checkbox">
-                              <input
-                                type="checkbox"
-                                checked={chatUseRag}
-                                onChange={(event) => setChatUseRag(event.target.checked)}
-                              />
-                              <span>开启 RAG Grounding</span>
-                            </label>
+                            <ToggleSwitchField
+                              id="toggle-chat-rag-grounding"
+                              title="RAG Grounding"
+                              description={
+                                chatUseRag
+                                  ? "依据检索到的正文片段作答，并尽量标注引用"
+                                  : "关闭后不绑定检索结果，可做自由闲聊"
+                              }
+                              checked={chatUseRag}
+                              disabled={busyAction === "chat"}
+                              onChange={setChatUseRag}
+                            />
                             <div className="inline-controls">
                               <span className="mono">Scope</span>
                               <select
                                 value={groundingScope}
-                                disabled={!chatUseRag}
+                                disabled={!chatUseRag || busyAction === "chat"}
                                 onChange={(event) =>
                                   setGroundingScope(event.target.value as ScopeMode)
                                 }
@@ -1302,7 +2102,9 @@ function App() {
                                 <option value="library">整个文献库</option>
                               </select>
                               <button
+                                type="button"
                                 className="secondary-button"
+                                disabled={busyAction === "chat"}
                                 onClick={() => setChatMessages([])}
                               >
                                 清空会话
@@ -1314,22 +2116,29 @@ function App() {
                               <div className="empty-state secondary chat-empty">
                                 <h3>还没有会话</h3>
                                 <p>
-                                  你可以让机器人解释论文方法、比较实验设置，或者关闭 RAG 做自由学术讨论。
+                                  你可以让机器人解释论文方法、比较实验设置，或者关闭 RAG
+                                  做自由学术讨论。
                                 </p>
                               </div>
                             ) : (
                               chatMessages.map((message) => (
                                 <div
                                   key={message.id}
-                                  className={`chat-bubble ${message.role === "assistant" ? "assistant" : "user"}`}
+                                  className={`chat-bubble ${message.role === "assistant" ? "assistant" : "user"} ${message.id === CHAT_PENDING_MESSAGE_ID ? "pending" : ""}`}
                                 >
                                   <div className="result-meta">
                                     <strong>{message.role === "assistant" ? "Briefly" : "你"}</strong>
                                     <span className="mono">
-                                      {message.model ?? formatDate(message.createdAt)}
+                                      {message.id === CHAT_PENDING_MESSAGE_ID
+                                        ? "生成中"
+                                        : (message.model ?? formatDate(message.createdAt))}
                                     </span>
                                   </div>
-                                  <p>{message.content}</p>
+                                  {message.id === CHAT_PENDING_MESSAGE_ID ? (
+                                    <ChatTypingIndicator useRag={chatUseRag} />
+                                  ) : (
+                                    <p>{message.content}</p>
+                                  )}
                                   {message.citations?.length ? (
                                     <div className="citation-row">
                                       {message.citations.map((citation) => (
@@ -1345,9 +2154,11 @@ function App() {
                           </div>
                           <textarea
                             rows={4}
-                            placeholder="例如：请把这篇论文的方法讲成一个可复现的实验流程。"
+                            placeholder="例如：请把这篇论文的方法讲成一个可复现的实验流程。Enter 发送 · Shift+Enter 换行"
                             value={chatDraft}
+                            disabled={!electronAvailable || busyAction === "chat"}
                             onChange={(event) => setChatDraft(event.target.value)}
+                            onKeyDown={handleChatKeyDown}
                           />
                           <div className="action-footer">
                             <span className="mono">
@@ -1357,7 +2168,13 @@ function App() {
                                   : "Grounded in full library"
                                 : "Free chat mode"}
                             </span>
-                            <button className="primary-button" onClick={handleChatSend}>
+                            <button
+                              type="button"
+                              className="primary-button"
+                              disabled={!electronAvailable || busyAction === "chat"}
+                              aria-busy={busyAction === "chat"}
+                              onClick={handleChatSend}
+                            >
                               {busyAction === "chat" ? "回复中…" : "发送消息"}
                             </button>
                           </div>
@@ -1453,18 +2270,36 @@ function App() {
                             </>
                           ) : null}
 
-                          <label className="checkbox-field compact-checkbox">
+                          <ToggleSwitchField
+                            id="toggle-auto-brief-after-import"
+                            title="导入后自动生成摘要"
+                            description="新 PDF 入库后尝试生成 Insight；也可在文献卡片里手动刷新"
+                            checked={settingsDraft.autoGenerateBriefs}
+                            className="toggle-field-setting"
+                            onChange={(next) =>
+                              updateSettingsDraft({
+                                autoGenerateBriefs: next,
+                              })
+                            }
+                          />
+
+                          <label className="field field-tight">
+                            <span>自定义背景（CSS 背景值）</span>
                             <input
-                              type="checkbox"
-                              checked={settingsDraft.autoGenerateBriefs}
-                              onChange={(event) =>
-                                updateSettingsDraft({
-                                  autoGenerateBriefs: event.target.checked,
-                                })
-                              }
+                              placeholder="例如：linear-gradient(135deg, #ffd89b 0%, #19547b 100%)"
+                              value={customBackground}
+                              onChange={(event) => setCustomBackground(event.target.value)}
                             />
-                            <span>导入后自动生成摘要</span>
                           </label>
+                          <div className="button-row">
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              onClick={() => setCustomBackground("")}
+                            >
+                              恢复默认背景
+                            </button>
+                          </div>
 
                           <button className="secondary-button full-width" onClick={handleSaveSettings}>
                             {busyAction === "settings" ? "保存中…" : "保存模式配置"}
@@ -1803,7 +2638,7 @@ function App() {
                       {searchResult?.hits[0] ? (
                         <>
                           <p className="insight-lead">
-                            {searchResult.hits[0].sectionTitle || "相关段落"} · p.{searchResult.hits[0].page}
+                            {searchResult.hits[0].sectionTitle || "相关正文段落"} · p.{searchResult.hits[0].page}
                           </p>
                           <p>{searchResult.hits[0].excerpt}</p>
                         </>
@@ -1837,9 +2672,25 @@ function App() {
                     </InsightCard>
 
                     <InsightCard title="聊天状态" eyebrow="Assistant">
-                      {latestAssistantMessage ? (
+                      {busyAction === "chat" ? (
                         <>
-                          <p className="insight-lead">{latestAssistantMessage.content.slice(0, 140)}</p>
+                          <p className="insight-lead insight-live">正在生成回复…</p>
+                          <div className="mini-stack">
+                            <div className="mini-row">
+                              <span>会话消息</span>
+                              <strong>{chatMessages.length}</strong>
+                            </div>
+                            <div className="mini-row">
+                              <span>模式</span>
+                              <strong>{chatUseRag ? "RAG Grounding" : "自由对话"}</strong>
+                            </div>
+                          </div>
+                        </>
+                      ) : latestAssistantMessage ? (
+                        <>
+                          <p className="insight-lead">
+                            {(latestAssistantMessage.content || "—").slice(0, 140)}
+                          </p>
                           <div className="mini-stack">
                             <div className="mini-row">
                               <span>会话消息</span>
@@ -1901,8 +2752,12 @@ function App() {
               </>
             ) : (
               <div className="empty-state large">
-                <h2>还没有选中文献</h2>
-                <p>先导入一批 PDF，或者从左侧文献列表里选择一篇论文开始。</p>
+                <h2>{electronAvailable ? "还没有选中文献" : "需要桌面完整环境"}</h2>
+                <p className="empty-lead">
+                  {electronAvailable
+                    ? "从中间文献列表点选一篇即可开始编辑元数据；若列表为空，可先发起导入。"
+                    : "预览模式仅能查看界面。请使用 npm run dev 启动 Electron 窗口以加载本地文献与模型。"}
+                </p>
               </div>
             )}
           </section>
